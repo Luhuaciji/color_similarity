@@ -218,7 +218,12 @@ project_root/
 - `brand_id`：标准化品牌 ID；
 - `product_id`：商品级 ID；
 - `shade_id`：色号级 ID；
-- `image_id`：图片级 ID；
+- `dataset_snapshot_id`：输入 CSV/数据集快照 ID；
+- `source_record_id`：源数据行级 ID；
+- `source_ref_id`：源数据中的图片 URL 引用 ID；
+- `folder_group_id`：原始品牌/商品目录分组 ID，不等同于最终商品 ID；
+- `image_id`：图片内容级 ID；
+- `image_occurrence_id`：图片物理路径/出现位置级 ID；
 - `region_id`：图中区域级 ID；
 - `ocr_span_id`：OCR 文本框 ID；
 - `run_id`：流水线运行 ID；
@@ -229,11 +234,22 @@ project_root/
 
 ```text
 image_id = SHA256(原始文件字节)
-product_id = UUIDv5(标准化品牌 + 标准化商品文件夹相对路径)
+image_occurrence_id = UUIDv5(dataset_snapshot_id + 规范化原始相对路径)
+source_record_id = UUIDv5(dataset_snapshot_id + 源行号 + 源行哈希)
+source_ref_id = UUIDv5(source_record_id + 图片字段 + 图片序号 + 规范化源 URL)
+folder_group_id = UUIDv5(dataset_snapshot_id + 原始品牌/商品目录相对路径)
+product_id = UUIDv5(规范品牌 ID + 实体归一化后的产品身份)
 region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 ```
 
 同一字节完全一致的图片使用同一 `image_id`，但保留多个来源路径记录。
+
+2026-07-27 首轮仓库审计确认，原始商品目录并不总是一行一商品或一行一色号：16 个目录合并了 48 个源 CSV 行，单目录最多对应 5 个 SKU；同一 `brand_id` 还可能对应多个品牌目录名。因此：
+
+- 原始目录只能生成 `folder_group_id`，不能直接生成最终 `product_id` 或 `shade_id`；
+- `product_id` 和 `shade_id` 只能在源记录、文件夹、OCR、图片和人工映射完成实体归一化后生成；
+- 一个物理图片 occurrence 可以被多个 `source_ref_id` 引用；
+- 现有预处理脚本生成的路径相关 `image_id` 必须迁移为 `legacy_image_id`，不得静默解释为内容 ID。
 
 ### 4.2 Manifest 是流水线入口
 
@@ -241,12 +257,20 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 
 ```json
 {
+  "dataset_snapshot_id": "dataset-...",
+  "source_record_ids": ["source-record-..."],
+  "source_ref_ids": ["source-ref-..."],
   "image_id": "sha256...",
+  "image_occurrence_id": "occurrence-...",
+  "folder_group_id": "folder-group-...",
   "source_path": "品牌/商品/图片.jpg",
   "brand_folder": "品牌",
   "product_folder": "商品",
   "filename": "图片.jpg",
   "extension": ".jpg",
+  "detected_format": "JPEG",
+  "mime_type": "image/jpeg",
+  "extension_mismatch": false,
   "byte_size": 123456,
   "width": 1200,
   "height": 1200,
@@ -259,6 +283,8 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
   "created_at": "ISO-8601"
 }
 ```
+
+上例是便于查看的 occurrence 级联表。正式存储应至少拆分为“数据集快照/源记录/源图片引用”“图片内容”“图片 occurrence”三层，并用多对多关系保留全部来源，不要把多个源 URL 或 SKU 压进一个不可查询的字符串字段。
 
 建议使用 Parquet 作为批处理主表，同时可导出 JSONL/CSV 供人工查看。
 
@@ -276,7 +302,12 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - 是否启用 Pillow 的截断容错必须配置化；
 - 容错解码成功的图片要标记 `decode_recovered=true`；
 - 不允许悄悄跳过错误文件；
-- 记录原始格式、颜色模式、透明通道和动画帧信息。
+- 记录文件扩展名、实际解码格式、MIME、颜色模式、透明通道和动画帧信息；
+- 使用文件头和实际解码结果识别格式，不得只信扩展名；
+- 扩展名和实际格式不一致时标记 `extension_mismatch=true`，但不得改名或覆盖原文件；
+- 显式支持 GIF/多帧输入，并记录选帧策略；
+- 将 `corrupt`、`policy_rejected` 和 `decode_recovered` 分开；
+- Pillow 的安全像素阈值、自定义硬上限和“仅生成缩小分析副本”阈值必须使用一致、可测试的策略。
 
 ### 5.2 色彩空间
 
@@ -310,9 +341,15 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - 压缩伪影指标；
 - 纯色边框或大面积白底比例；
 - 图片是否过小；
-- 图片是否严重截断。
+- 图片是否严重截断；
+- 扩展名与实际格式是否一致；
+- 是否为极端长宽比、整页详情长图或装饰条；
+- 长图是否需要切片，以及 tile 到原图的坐标变换；
+- 是否因安全/资源策略拒绝，而不是文件本身损坏。
 
 质量分数不能直接决定代表色，只作为角色分类和代表色置信度的特征。
+
+首轮真实数据中存在 1074×28190 的整页详情长图、750×1 的装饰条和 229 个扩展名/实际格式不一致文件。长图必须生成只读派生 tile，并保留 tile 坐标、重叠范围和原图坐标回映；严格解码成功也不能自动等同于业务有效。
 
 ---
 
@@ -349,6 +386,16 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - `contains_packaging`；
 - `representative_color_eligible`；
 - `information_extraction_eligible`。
+
+首轮真实数据还要求保留版式维度，但不改变上述八类核心角色语义：
+
+- `layout_type`：例如 `single_panel`、`collage`、`grid`、`long_detail_strip`；
+- `is_extreme_aspect_ratio`；
+- `is_decorative_strip`；
+- `tile_role_results`：长图各 tile/region 的角色、置信度和原图坐标；
+- `context_shade` 与 `depicted_shades`：区分目录上下文色号和图片实际展示色号。
+
+`pic_list`、`show_pic` 等下载来源字段只能作为弱特征，不能直接映射到角色或代表色资格。
 
 ### 6.3 视觉大模型结构化输出
 
@@ -776,6 +823,20 @@ Codex 应实现可追溯解析器，保留：
 }
 ```
 
+#### 12.1.1 源数据和目录必须分层
+
+本仓库首轮审计确认：
+
+- 源 CSV 有 2309 行、2308 个唯一 `sku_id`；
+- 16 个商品目录合并了 48 个源行，单目录最多对应 5 个 SKU/色号；
+- 92 个非空 `brand_id` 形成 101 个品牌目录名，其中 9 个品牌 ID 有两个目录别名；
+- 部分 `sku_color_no` 实际是 `3g`、`5ml` 等容量，真正色号存在于 `sku_name`；
+- N19 商品目录中的图片可能同时展示 N18、N19、N03、N05。
+
+因此必须原样保存 `asset_id`、`sku_id`、`goods_id`、`brand_id`、`brand_name`、`sku_name`、`sku_concat_name`、`sku_color_no`、源 CSV 行号、源 URL 和完整原始行。文件夹解析结果只是 evidence claim，不能覆盖源字段；`sku_color_no` 也不能无条件写成确认色号。
+
+图片与源行使用多对多关系。目录中的上下文色号写为 `context_shade`，图片实际展示的一个或多个色号写为 `depicted_shades`。
+
 ### 12.2 融合优先级
 
 不能简单规定所有字段都以某一来源为准。推荐按字段设置来源优先级。
@@ -865,6 +926,77 @@ Codex 应实现可追溯解析器，保留：
 
 ### 14.2 推荐表结构
 
+#### `dataset_snapshots`
+
+- `dataset_snapshot_id`
+- `source_path`
+- `source_sha256`
+- `row_count`
+- `column_schema_json`
+- `created_at`
+
+#### `source_records`
+
+- `source_record_id`
+- `dataset_snapshot_id`
+- `row_number`
+- `row_hash`
+- `asset_id_raw`
+- `sku_id_raw`
+- `goods_id_raw`
+- `brand_id_raw`
+- `brand_name_raw`
+- `sku_name_raw`
+- `sku_concat_name_raw`
+- `sku_color_no_raw`
+- `raw_record_json`
+
+#### `source_image_refs`
+
+- `source_ref_id`
+- `source_record_id`
+- `source_field`
+- `image_index`
+- `source_url`
+- `source_url_hash`
+- `download_status`
+
+#### `image_occurrences`
+
+- `image_occurrence_id`
+- `image_id`
+- `folder_group_id`
+- `relative_path`
+- `filename`
+- `extension`
+- `detected_format`
+- `extension_mismatch`
+- `brand_folder_raw`
+- `product_folder_raw`
+- `legacy_image_id`
+
+#### `source_ref_occurrences`
+
+- `source_ref_id`
+- `image_occurrence_id`
+- `match_method`
+- `match_confidence`
+
+#### `pipeline_runs`
+
+- `run_id`
+- `dataset_snapshot_id`
+- `stage`
+- `pipeline_version`
+- `schema_version`
+- `git_commit`
+- `config_json`
+- `config_hash`
+- `dependency_snapshot_json`
+- `started_at`
+- `finished_at`
+- `status`
+
 #### `brands`
 
 - `brand_id`
@@ -894,13 +1026,13 @@ Codex 应实现可追溯解析器，保留：
 #### `images`
 
 - `image_id`
-- `source_path`
 - `sha256`
-- `phash`
-- `width`
-- `height`
-- `decode_status`
-- `quality_json`
+- `byte_size`
+- `detected_format`
+- `mime_type`
+- `first_seen_at`
+
+路径、下载来源、解码观察和质量指标不要直接压在内容级 `images` 一行中；分别关联 `image_occurrences`、`source_image_refs` 和版本化预处理观察表。同一 `image_id` 可以有多个 occurrence。
 
 #### `image_roles`
 
@@ -1271,14 +1403,19 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 
 完成：
 
-- 稳定 ID；
+- 源 CSV/数据集快照和完整原始行留存；
+- `source_record_id`、`source_ref_id`、`folder_group_id`、内容 `image_id` 和 `image_occurrence_id`；
+- 源图片引用—物理路径—内容哈希的多对多 manifest；
 - 图片读取；
+- 扩展名/实际格式/MIME 检测；
 - 去重；
 - 质量检测；
-- 日志；
-- 配置；
+- 长图和极端尺寸策略；
+- 不可覆盖的运行日志；
+- 配置快照、Git 提交、依赖快照和 transform fingerprint；
 - 断点续跑；
-- SQLite/Parquet 基础存储。
+- SQLite/Parquet 基础存储；
+- 现有路径相关 `image_id` 的显式迁移。
 
 ### 阶段 2：图片角色分类
 
@@ -1326,7 +1463,7 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 - 多图融合；
 - 实体归一化；
 - 新色号候选；
-- 知识数据库；
+- 在阶段 1 最小数据库之上完成知识层表；
 - 查询和导出接口。
 
 ### 阶段 7：人工审核和持续学习
@@ -1560,4 +1697,18 @@ Codex 接收本指南后，应按以下顺序执行：
 ## 26. 变更记录
 
 - 初始版本：建立从图片角色分类、代表色提取、OCR、多色号空间匹配、多图片融合到知识数据库和人工审核的总体实现规范。
-- 后续由 Codex 根据仓库审计和真实数据分析继续维护。
+- 2026-07-27：
+  - 修改章节：4.1、4.2、5.1、5.4、6.2、12.1、14.2、19。
+  - 修改内容：显式增加数据集快照、源记录、图片 URL 引用、目录分组、内容图片和物理 occurrence 的分层 ID/表；规定扩展名与实际格式分开、GIF/长图/极端尺寸策略；补充目录上下文色号与图片实际展示色号；把最小数据库和运行指纹提前到阶段 1。
+  - 修改原因：真实目录不是稳定实体边界，扩展名也不是可靠格式；必须先修复来源血缘和运行可复现性。
+  - 证据来源：
+    - `docs/repository_audit.md` 的全量统计和视觉抽样；
+    - `data/dim_pub_sku_20260513_115554_口红唇膏唇蜜唇釉.csv`：2309 行、2308 个唯一 `sku_id`；
+    - `downloaded_images/`：101 个品牌目录、2277 个商品目录、31,511 张图片；
+    - 16 个商品目录合并 48 个源行，9 个 `brand_id` 存在两个目录别名；
+    - `image_preprocessing_output/metadata/image_preprocessing.csv`：12,386 个唯一 SHA256、229 个扩展名/实际格式错配、3 个严格解码失败；
+    - `image_preprocessing_pipeline/preprocess_product_images.py:402`：现有路径相关 `image_id`；
+    - `download_product_images.py:151`：Windows 双斜杠 URL 后缀识别问题。
+  - 兼容性影响：八类核心角色标签、原图只读、模型原始/解析双留存和 `image_id=SHA256` 底线不变；现有预处理 `image_id` 迁移为 `legacy_image_id`，原始目录只生成 `folder_group_id`，不再直接充当最终 `product_id`。正式实现必须提供迁移映射，不覆盖旧元数据。
+  - 修改人/代理：Codex。
+- 后续由 Codex 根据仓库审计、固定评估集和真实数据分析继续维护。
