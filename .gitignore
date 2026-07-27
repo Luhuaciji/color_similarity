@@ -1,3 +1,13 @@
 /downloaded_images/
 /image_preprocessing_output/
-/test_qwen36_vision.py
+
+# Local credentials and machine-specific runtime configuration.
+.env
+.env.*
+!.env.example
+
+# Generated manifests, databases, reports, and Python caches.
+/stage1_output/
+__pycache__/
+*.py[cod]
+.pytest_cache/

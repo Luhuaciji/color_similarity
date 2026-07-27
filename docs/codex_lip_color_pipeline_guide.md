@@ -9,6 +9,8 @@
 > OpenAI 兼容 Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
 >
 > 完整请求端点：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
+>
+> 最新修订：2026-07-28；详细阶段输入、输出、字段、测试和验收以 `docs/implementation_plan.md` 为准
 
 ---
 
@@ -66,6 +68,8 @@ Lab聚类与代表色计算         色号—名称—色块空间匹配
                ▼
        人工审核与持续学习
 ```
+
+其中“图片角色分类/资格判断”和“文件夹名称与图片信息融合”必须分成两层：先做不含当前 SKU、folder 目标色号或 `context_shade` 的内容视觉分析，再在 occurrence/source context 层判断该图片与当前商品的关系。两层不能写入同一张混合语义表。
 
 ---
 
@@ -251,6 +255,8 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - 一个物理图片 occurrence 可以被多个 `source_ref_id` 引用；
 - 现有预处理脚本生成的路径相关 `image_id` 必须迁移为 `legacy_image_id`，不得静默解释为内容 ID。
 
+当前 CSV 与当前下载器能够重建当前 31,513 条 URL 引用到 31,511 个物理目标路径的关系，但下载器没有保存不可变成功 manifest。该可重建性依赖 CSV 快照、路径清洗/命名规则和文件集合保持不变，不能等同于长期稳定追溯。
+
 ### 4.2 Manifest 是流水线入口
 
 第一阶段生成统一 manifest，至少包含：
@@ -286,7 +292,7 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 
 上例是便于查看的 occurrence 级联表。正式存储应至少拆分为“数据集快照/源记录/源图片引用”“图片内容”“图片 occurrence”三层，并用多对多关系保留全部来源，不要把多个源 URL 或 SKU 压进一个不可查询的字符串字段。
 
-建议使用 Parquet 作为批处理主表，同时可导出 JSONL/CSV 供人工查看。
+阶段 1 强制使用 SQLite 保存关系/约束，并使用 JSONL 保存可审计 manifest。Parquet 和全量 CSV 镜像后置为可选导出，不作为阶段 1 门禁；如后续生成，必须能由同一 `run_id`、schema version 和 SQLite/JSONL 规范记录复现。
 
 ---
 
@@ -344,12 +350,12 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - 图片是否严重截断；
 - 扩展名与实际格式是否一致；
 - 是否为极端长宽比、整页详情长图或装饰条；
-- 长图是否需要切片，以及 tile 到原图的坐标变换；
+- 长图全局缩略图、重叠 tile，以及 tile 到原图的坐标变换；
 - 是否因安全/资源策略拒绝，而不是文件本身损坏。
 
 质量分数不能直接决定代表色，只作为角色分类和代表色置信度的特征。
 
-首轮真实数据中存在 1074×28190 的整页详情长图、750×1 的装饰条和 229 个扩展名/实际格式不一致文件。长图必须生成只读派生 tile，并保留 tile 坐标、重叠范围和原图坐标回映；严格解码成功也不能自动等同于业务有效。
+首轮真实数据中存在 1074×28190 的整页详情长图、750×1 的装饰条和 229 个扩展名/实际格式不一致文件。长图必须同时生成保留整体比例的全局缩略图和只读重叠 tile，不能只做 tile。必须保存全局布局/阅读轴、tile 原图坐标、重叠范围、双向坐标变换、跨 tile OCR 去重链和原图坐标回映；严格解码成功也不能自动等同于业务有效。
 
 ---
 
@@ -392,12 +398,32 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - `layout_type`：例如 `single_panel`、`collage`、`grid`、`long_detail_strip`；
 - `is_extreme_aspect_ratio`；
 - `is_decorative_strip`；
-- `tile_role_results`：长图各 tile/region 的角色、置信度和原图坐标；
-- `context_shade` 与 `depicted_shades`：区分目录上下文色号和图片实际展示色号。
+- `global_layout`：长图全局缩略图上的整体布局和阅读顺序；
+- `tile_role_results`：长图各重叠 tile/region 的角色、置信度和原图坐标。
 
-`pic_list`、`show_pic` 等下载来源字段只能作为弱特征，不能直接映射到角色或代表色资格。
+`pic_list`、`show_pic`、SKU、商品目录和 `context_shade` 不得输入内容角色/资格分析。它们只能在后续 occurrence 来源上下文融合层作为弱证据，不能直接映射到角色或代表色资格。
 
-### 6.3 视觉大模型结构化输出
+### 6.3 内容视觉分析与来源上下文融合必须分层
+
+#### A 层：`image_id`/tile 内容视觉分析
+
+- 输入只包含 `image_id` 对应内容，或其版本化全局缩略图/重叠 tile；
+- 不输入当前 SKU、folder、商品目录目标色号、`context_shade` 或 source record；
+- 输出八类角色、布局、可见对象、`depicted_shades` 候选、代表色资格和候选区域；
+- 同一 SHA256 在相同模型、提示词、参数和分析资产下只调用/缓存一次；
+- 长图先用全局缩略图识别整体布局，再用重叠 tile 补充局部，最终回映原图。
+
+#### B 层：`image_occurrence_id` 来源上下文融合
+
+- 输入 A 层事实和 `image_occurrence_id`；
+- 结合 folder、CSV 原始行、SKU、source ref 与 `context_shade`；
+- 输出该图片与当前来源商品/色号的关系、`depicted_shades` 与 `context_shade` 的包含/冲突状态、置信度和审核状态；
+- 同一内容的不同 occurrence/source context 可以有不同关系判断；
+- 上下文或融合规则改变时只重算 B 层，不使 A 层缓存失效。
+
+数据库分别使用 `content_visual_analyses` 和 `occurrence_context_fusions`。不得继续用一张 `image_roles` 写表同时保存 A/B 两层结果，也不得通过上下文暗示污染 A 层提示词。
+
+### 6.4 视觉大模型结构化输出
 
 `qwen3.6-plus` 负责：
 
@@ -417,6 +443,8 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 ```json
 {
   "schema_version": "1.0",
+  "analysis_scope": "merged_content_summary",
+  "input_context_policy": "image_only",
   "primary_role": "single_swatch",
   "secondary_roles": ["text_promo"],
   "role_confidence": 0.94,
@@ -438,7 +466,7 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 }
 ```
 
-### 6.4 提示词要求
+### 6.5 提示词要求
 
 提示词应：
 
@@ -448,6 +476,7 @@ region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
 - 要求不确定时降低置信度；
 - 不允许将包装颜色当作膏体代表色；
 - 不允许将文字背景色直接当作商品色；
+- 内容视觉提示词禁止包含当前 SKU、folder 目标色号或 `context_shade`；
 - 对多色号图必须报告色号数量估计和布局类型；
 - 对唇部效果图必须报告皮肤、牙齿、高光、阴影和滤镜风险。
 
@@ -458,7 +487,7 @@ prompt_name=image_role
 prompt_version=1.0.0
 ```
 
-### 6.5 分类实现策略
+### 6.6 分类实现策略
 
 第一版可以采用：
 
@@ -482,6 +511,8 @@ prompt_version=1.0.0
 ## 7. 代表色提取资格判断
 
 图片角色和“是否适合代表色提取”不是同一概念。
+
+这里的资格首先是 A 层对图片自身可见内容的判断，不使用当前 SKU 或目录目标色号。图片是否能作为**当前**商品/色号的证据，由 B 层 occurrence 来源上下文融合另行判断。
 
 ### 7.1 通常优先级
 
@@ -593,7 +624,7 @@ Codex 应通过小规模标注集比较方案，而不是预设某一个模型�
 
 ---
 
-## 9. 颜色校正、像素过滤与代表色计算
+## 9. 色彩归一化、像素过滤与 image-observed 代表色计算
 
 ### 9.1 基本原则
 
@@ -601,7 +632,8 @@ Codex 应通过小规模标注集比较方案，而不是预设某一个模型�
 - 视觉大模型生成的 HEX 只能作为候选或一致性检查；
 - 颜色计算默认在 sRGB 派生图上进行；
 - 聚类和色差计算使用 CIE Lab；
-- 所有结果保留原始 RGB、sRGB HEX、Lab 和算法版本。
+- 所有结果保留原始 RGB、sRGB HEX、Lab 和算法版本；
+- 数据库颜色的默认语义是 `image-observed representative color`，即特定图片、后期处理、照明和显示色彩空间下的像素观测代表色，不是未经校准的真实物理颜色。
 
 ### 9.2 不要进行无依据的全局白平衡
 
@@ -610,9 +642,14 @@ Codex 应通过小规模标注集比较方案，而不是预设某一个模型�
 建议保存：
 
 - `raw_srgb_color`：统一 sRGB 后的结果；
-- `corrected_color`：只有在有明确校正依据时生成；
-- `correction_method`；
-- `correction_confidence`。
+- `normalized_color`：经过有版本、参数和证据的确定性标准化/归一化后的观测结果；
+- `normalization_method`；
+- `normalization_reference_id`；
+- `normalization_evidence_json`；
+- `normalization_confidence`；
+- `color_semantics=image_observed_representative`。
+
+不使用含义不清的 `corrected_*` 字段。只有存在可验证的色卡、设备和照明校准链时，才可另增 `calibrated_*` 字段及校准记录；`normalized_*` 不能被解释为 calibrated 或真实物理颜色。
 
 ### 9.3 像素过滤
 
@@ -643,6 +680,7 @@ Codex 应通过小规模标注集比较方案，而不是预设某一个模型�
 
 ```json
 {
+  "color_semantics": "image_observed_representative",
   "representative_hex": "#A84F5B",
   "rgb": [168, 79, 91],
   "lab": [46.8, 37.2, 14.1],
@@ -736,6 +774,7 @@ Codex 应通过小规模标注集比较方案，而不是预设某一个模型�
 - 色块、膏泥、试色或膏体区域列表；
 - OCR 文本框列表；
 - VLM 提供的布局与阅读顺序；
+- 长图全局缩略图提供的整体布局，以及重叠 tile 的原图坐标映射；
 - 可能存在的连接线、编号、箭头、表格结构；
 - 文件夹和商品系列上下文。
 
@@ -759,6 +798,8 @@ Codex 应通过小规模标注集比较方案，而不是预设某一个模型�
 - 二分图匹配；
 - 图优化；
 - 对复杂布局使用 VLM 结构化复核。
+
+长图必须先在全局缩略图上确定整体布局/阅读顺序，再把 tile 区域和 OCR 框回映到原图坐标。跨 tile OCR 使用规范化文本、坐标重叠和置信度形成去重组，保留全部来源 span、canonical span 和去重理由；配对算法只能对回映、去重后的对象计数。
 
 ### 11.3 输出
 
@@ -835,7 +876,7 @@ Codex 应实现可追溯解析器，保留：
 
 因此必须原样保存 `asset_id`、`sku_id`、`goods_id`、`brand_id`、`brand_name`、`sku_name`、`sku_concat_name`、`sku_color_no`、源 CSV 行号、源 URL 和完整原始行。文件夹解析结果只是 evidence claim，不能覆盖源字段；`sku_color_no` 也不能无条件写成确认色号。
 
-图片与源行使用多对多关系。目录中的上下文色号写为 `context_shade`，图片实际展示的一个或多个色号写为 `depicted_shades`。
+图片与源行使用多对多关系。目录中的上下文色号写为 `context_shade`，图片实际展示的一个或多个色号写为 `depicted_shades`。前者只能进入 B 层 `occurrence_context_fusions`；后者首先来自 A 层内容观察，再由 B 层与每个 occurrence/source context 比较。不得回填 A 层角色结果来迎合当前目录色号。
 
 ### 12.2 融合优先级
 
@@ -898,8 +939,9 @@ Codex 应实现可追溯解析器，保留：
 ```json
 {
   "shade_id": "...",
-  "final_hex": "#A84F5B",
-  "final_lab": [46.8, 37.2, 14.1],
+  "color_semantics": "image_observed_representative",
+  "representative_srgb_hex": "#A84F5B",
+  "representative_lab": [46.8, 37.2, 14.1],
   "fusion_method": "weighted_lab_medoid_v1",
   "evidence_image_count": 5,
   "accepted_image_count": 4,
@@ -1023,7 +1065,7 @@ Codex 应实现可追溯解析器，保留：
 - `normalized_descriptor_json`
 - `status`
 
-#### `images`
+#### `image_contents`（旧草案名 `images`）
 
 - `image_id`
 - `sha256`
@@ -1032,17 +1074,74 @@ Codex 应实现可追溯解析器，保留：
 - `mime_type`
 - `first_seen_at`
 
-路径、下载来源、解码观察和质量指标不要直接压在内容级 `images` 一行中；分别关联 `image_occurrences`、`source_image_refs` 和版本化预处理观察表。同一 `image_id` 可以有多个 occurrence。
+路径、下载来源、解码观察和质量指标不要直接压在内容级 `image_contents` 一行中；分别关联 `image_occurrences`、`source_image_refs` 和版本化预处理观察表。同一 `image_id` 可以有多个 occurrence。旧草案名 `images` 只作为文档别名，正式 schema 使用 `image_contents`。
 
-#### `image_roles`
+#### `content_visual_analyses`（A 层）
 
+- `content_visual_analysis_id`
 - `image_id`
+- `analysis_scope`
+- `analysis_asset_id`
+- `parent_content_visual_analysis_id`
+- `tile_bbox_image_json`
 - `primary_role`
 - `secondary_roles_json`
+- `layout_type`
+- `global_layout_json`
 - `role_confidence`
+- `depicted_shades_json`
 - `representative_color_eligible`
 - `eligibility_score`
+- `recommended_strategy`
 - `model_run_id`
+- `schema_version`
+
+该表只保存内容级事实，禁止出现 `image_occurrence_id`、当前 SKU、folder 目标色号或 `context_shade`。
+
+#### `occurrence_context_fusions`（B 层）
+
+- `occurrence_context_fusion_id`
+- `image_occurrence_id`
+- `source_record_id`
+- `source_ref_id`
+- `folder_group_id`
+- `content_visual_analysis_id`
+- `source_sku_id_raw`
+- `folder_context_json`
+- `csv_context_json`
+- `context_shade_json`
+- `depicted_shades_json`
+- `relationship_to_context`
+- `context_conflicts_json`
+- `fusion_method`
+- `fusion_version`
+- `confidence`
+- `review_status`
+- `run_id`
+
+同一 occurrence 关联多个 source record 时分行保存，不覆盖。不得创建可写的单一 `image_roles` 表把两层重新混合。
+
+#### `long_image_layouts`
+
+- `long_image_layout_id`
+- `image_id`
+- `global_thumbnail_asset_id`
+- `global_layout_json`
+- `reading_axis`
+- `image_to_thumbnail_transform_json`
+- `tiling_strategy_version`
+
+#### `image_tiles`
+
+- `image_tile_id`
+- `long_image_layout_id`
+- `tile_asset_id`
+- `tile_index`
+- `bbox_image_json`
+- `overlap_before_px`
+- `overlap_after_px`
+- `tile_to_image_transform_json`
+- `transform_fingerprint`
 
 #### `regions`
 
@@ -1058,9 +1157,16 @@ Codex 应实现可追溯解析器，保留：
 
 - `ocr_span_id`
 - `image_id`
+- `image_occurrence_id`
+- `tile_asset_id`
 - `text_raw`
 - `text_normalized`
-- `bbox_json`
+- `bbox_tile_json`
+- `bbox_image_json`
+- `source_tile_ids_json`
+- `dedupe_group_id`
+- `canonical_ocr_span_id`
+- `dedupe_method`
 - `ocr_confidence`
 - `engine`
 
@@ -1076,10 +1182,17 @@ Codex 应实现可追溯解析器，保留：
 
 - `color_candidate_id`
 - `image_id`
+- `image_occurrence_id`
 - `region_id`
-- `hex`
-- `rgb_json`
-- `lab_json`
+- `raw_srgb_hex`
+- `raw_srgb_rgb_json`
+- `raw_srgb_lab_json`
+- `normalized_srgb_hex`
+- `normalized_srgb_rgb_json`
+- `normalized_lab_json`
+- `normalization_method`
+- `normalization_evidence_json`
+- `color_semantics`
 - `method`
 - `confidence`
 - `diagnostics_json`
@@ -1087,9 +1200,11 @@ Codex 应实现可追溯解析器，保留：
 #### `shade_representative_colors`
 
 - `shade_id`
-- `hex`
-- `rgb_json`
-- `lab_json`
+- `representative_srgb_hex`
+- `representative_srgb_rgb_json`
+- `representative_lab_json`
+- `color_semantics`
+- `normalization_summary_json`
 - `fusion_method`
 - `confidence`
 - `evidence_summary_json`
@@ -1115,8 +1230,15 @@ Codex 应实现可追溯解析器，保留：
 - `base_url_alias`
 - `prompt_name`
 - `prompt_version`
+- `analysis_layer`
+- `analysis_unit_type`
+- `analysis_unit_id`
+- `input_context_policy`
 - `request_hash`
-- `response_path`
+- `request_path`
+- `raw_response_path`
+- `parsed_response_path`
+- `schema_validation_status`
 - `latency_ms`
 - `token_usage_json`
 - `status`
@@ -1136,7 +1258,8 @@ Codex 应实现可追溯解析器，保留：
 
 ### 14.3 数据库技术选择
 
-- 本地开发和中小规模：SQLite + Parquet；
+- 阶段 1 规范门禁：SQLite + JSONL；
+- 后续批处理/训练导出：可选 Parquet；全量 CSV 镜像也仅作可选兼容导出；
 - 多用户、持续写入和服务化：PostgreSQL；
 - 大量图片和 mask：文件系统或对象存储，数据库只存路径和哈希；
 - 原始模型响应建议保存为压缩 JSONL 文件，不全部塞入关系数据库。
@@ -1148,6 +1271,16 @@ Codex 应实现可追溯解析器，保留：
 ### 15.1 配置
 
 不得在代码中硬编码 API Key。
+
+仓库审计已在受 Git 跟踪的 `test_qwen36_vision.py:21` 发现明文 Key，因此安全处置是阶段 0.5 `hard_gate`，必须早于阶段 1 及任何 Pilot：
+
+1. 在供应商侧轮换或吊销旧 Key；
+2. 从受跟踪代码删除真实值；
+3. 本地开发使用被 `.gitignore` 排除的 `.env`，只提交含无效占位符的 `.env.example`，生产环境使用环境变量或密钥管理；
+4. 扫描工作树、索引和全部本地可达 Git 提交，并用假密钥 fixture 验证扫描规则有效；
+5. 明确泄露提交是否已经推送；若已推送，检查远程可达分支/tag 历史并记录处置结论；
+6. 如需重写共享历史，必须另行评估协作者影响并协调执行，不能无记录强推；
+7. 日志、异常、测试和扫描报告不得回显真实 Key 或完整认证头。
 
 ```text
 DASHSCOPE_API_KEY
@@ -1163,8 +1296,9 @@ DASHSCOPE_MODEL=qwen3.6-plus
 
 - 检查图片格式；
 - 检查编码后大小；
-- 对超大图片生成分析副本；
+- 对超大/长图片生成全局缩略图和必要的重叠 tile 分析副本，不能只提交 tile；
 - 记录分析副本尺寸和哈希；
+- 记录全局布局、tile 原图坐标、重叠范围和双向坐标变换；
 - 不修改原图；
 - 可选使用 JPEG/WEBP 压缩以降低请求体积，但必须记录压缩参数。
 
@@ -1184,16 +1318,25 @@ DASHSCOPE_MODEL=qwen3.6-plus
 ### 15.4 缓存键
 
 ```text
-cache_key = SHA256(
+content_cache_key = SHA256(
     image_sha256
+    + analysis_asset_sha256
     + model_name
     + prompt_name
     + prompt_version
     + generation_parameters
 )
+
+context_fusion_cache_key = SHA256(
+    image_occurrence_id
+    + source_record_id/source_ref_id
+    + content_visual_analysis_id
+    + folder_csv_sku_context_hash
+    + fusion_version
+)
 ```
 
-图片和提示词不变时，应复用缓存，避免重复费用。
+A 层 `content_cache_key` 禁止包含当前 SKU、folder 或 `context_shade`；同一内容/分析资产和提示词不变时复用一次，避免重复费用。B 层上下文变化只使 `context_fusion_cache_key` 失效，不得使 A 层重复调用。
 
 ### 15.5 重试与错误处理
 
@@ -1272,6 +1415,8 @@ cache_key = SHA256(
 
 ## 17. 人工审核与持续学习
 
+人工能力分两步建设：阶段 2.5 先提供最小标注/核查工具，用于创建角色、代表色资格、mask 和多色号固定评估集；阶段 8 再扩展为完整审核系统。阶段 2.5 不得被解释为已经完成阶段 8 的任务队列、权限、并发、优先级、裁决、回归和持续学习能力。
+
 ### 17.1 审核对象
 
 优先审核：
@@ -1336,6 +1481,10 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 - 白底、黑底、复杂背景；
 - 中文、英文、中英混合文字；
 - 单色图和多色号图；
+- 长图全局缩略图 + 重叠 tile；
+- 扩展名/真实格式错配；
+- 相同 SHA256 的多个 occurrence；
+- 商品目录碰撞和多 source context；
 - 哑光、亮面、透明、珠光；
 - 裸色、深色、高饱和和低饱和颜色；
 - 正常图片和损坏图片。
@@ -1347,27 +1496,31 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 - Accuracy；
 - Macro-F1；
 - 各类别 Precision/Recall；
-- 代表色资格 Precision/Recall；
+- 代表色资格 Precision、Recall、F1、Coverage；
 - 混淆矩阵。
 
 对“可提取代表色”应优先控制假阳性，即不要把包装图或宣传图错误送入颜色流水线。
 
+资格 Coverage 定义为“非 abstain 的自动资格判断数 / 资格评估项总数”。同时报告“每商品至少一个有效颜色证据覆盖率”：至少有一个通过资格、region/mask 与质量门的颜色证据的 in-scope 商品上下文数 / 全部 in-scope 商品上下文数，并分列无可用证据原因。
+
 #### OCR
 
-- 字符准确率；
-- 色号编号准确率；
+- CER；
+- shade-code exact match；
 - 色号名称准确率；
 - 文本框检测召回率。
+
+shade-code exact match 和 CER 使用版本化的 Unicode、大小写、空白与连字符归一化规则；长图另报跨 tile 去重前后结果。
 
 #### 色号—色块匹配
 
 - 匹配准确率；
-- 完全正确图片比例；
+- 多色号整图完全匹配率：全部期望配对正确且无多配/漏配；
 - 歧义检测召回率。
 
 #### 代表色
 
-- 与人工选区结果的 ΔE00；
+- 与同图人工选区 image-observed 结果的 Median ΔE00 和 P90 ΔE00；
 - 同一色号跨图片一致性；
 - mask IoU；
 - 高光/背景误选率；
@@ -1375,15 +1528,23 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 
 ### 18.3 初始验收目标
 
-以下仅作为第一阶段工程目标，Codex 可根据数据审计后修订，并记录原因：
+以下性能数字全部是 `provisional_target`，不是已冻结门禁。只有完成阶段 1.5 Pilot 和阶段 2.5 首轮人工标注、检查分层样本量与误差后，才能写入版本化 `frozen` 阈值：
 
-- 图片角色 Macro-F1 不低于 0.85；
-- 代表色资格判断 Precision 不低于 0.90；
-- 清晰多色号图的色号—色块匹配准确率不低于 0.90；
-- 清晰色号编号 OCR 准确率不低于 0.95；
-- 高质量单色图中，自动代表色与人工选区中位数 ΔE00 尽量控制在 5 以内；
+- `provisional_target`：图片角色 Macro-F1 ≥ 0.85；
+- `provisional_target`：代表色资格 Precision ≥ 0.90；
+- `provisional_target`：代表色资格 Recall、F1、Coverage 待 Pilot/首轮标注基线后填写；
+- `provisional_target`：每商品至少一个有效颜色证据覆盖率待 Pilot/首轮标注基线后填写；
+- `provisional_target`：清晰多色号图配对准确率 ≥ 0.90；
+- `provisional_target`：多色号整图完全匹配率待 Pilot/首轮标注基线后填写；
+- `provisional_target`：shade-code exact match ≥ 0.95，CER ≤ 0.05；
+- `provisional_target`：高质量单色图自动结果与同图人工选区的 Median ΔE00 ≤ 5、P90 ΔE00 ≤ 10。
+
+以下属于 `hard_gate`，不因性能阈值尚未冻结而放宽：
+
 - 所有失败样本均可定位到明确阶段和错误类型；
-- 断点续跑不会重复处理已成功且版本未变化的数据。
+- 断点续跑不会重复处理已成功且版本未变化的数据；
+- 所有模型尝试保留请求、原始响应、解析/Schema 状态；
+- 原图不修改且所有结果可追溯。
 
 ---
 
@@ -1399,64 +1560,113 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 - 修订后的实施计划；
 - 本指南的第一轮变更记录。
 
-### 阶段 1：Manifest 和基础设施
+### 阶段 0.5：明文密钥泄露处置（阻断）
+
+> 实施状态（2026-07-28）：Git 当前树、本地可达历史和远端 `origin/main` 历史清理及 `.env`/扫描门禁已完成。仓库所有者明确豁免供应商侧失效确认，因此状态为 `passed_with_owner_override`，不是“已验证轮换/吊销”。详见 `docs/stage0_5_security_report.md`。
+
+在任何后续阶段前完成：
+
+- 轮换或吊销已暴露 Key，并从受跟踪代码移除；
+- 本地 `.env` + 安全 `.env.example`/环境变量接入；
+- 工作树、索引和本地可达 Git 历史密钥扫描；
+- 核查泄露提交是否已推送；若已推送，检查远程可达历史并记录处置。
+
+### 阶段 1：Manifest、稳定 ID 和最小数据库
+
+> 实施状态（2026-07-28）：正式运行 `stage1_full_20260728` 已完成并通过独立验收；SQLite + JSONL、稳定 ID、旧 ID 映射和原图完整性基线均已生成。详见 `docs/stage1_completion_report.md`。
 
 完成：
 
 - 源 CSV/数据集快照和完整原始行留存；
 - `source_record_id`、`source_ref_id`、`folder_group_id`、内容 `image_id` 和 `image_occurrence_id`；
-- 源图片引用—物理路径—内容哈希的多对多 manifest；
-- 图片读取；
-- 扩展名/实际格式/MIME 检测；
-- 去重；
-- 质量检测；
-- 长图和极端尺寸策略；
-- 不可覆盖的运行日志；
-- 配置快照、Git 提交、依赖快照和 transform fingerprint；
-- 断点续跑；
-- SQLite/Parquet 基础存储；
+- 将当前可重建关系固化为不可变的源图片引用—物理路径—内容哈希多对多 manifest；
+- SQLite + JSONL 规范存储；
 - 现有路径相关 `image_id` 的显式迁移。
 
-### 阶段 2：图片角色分类
+Parquet 和全量 CSV 镜像是后续可选导出，不是阶段 1 门禁。
+
+### 阶段 1.5：50–100 唯一 SHA256 VLM Pilot
+
+用覆盖八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞的样本跑通：
+
+- 图片读取；
+- 全局缩略图 + 重叠 tile；
+- A 层内容分类；
+- JSON Schema 校验；
+- 请求/原始响应/解析结果双留存；
+- SQLite；
+- B 层 occurrence 上下文融合；
+- 人工核查。
+
+### 阶段 2：预处理加固与迁移
 
 完成：
 
-- 角色提示词；
-- qwen3.6-plus 调用；
-- JSON 校验；
-- 缓存；
-- 分类报告；
-- 第一批人工评估集。
+- 扩展名/实际格式/MIME 检测；
+- 去重；
+- 质量检测；
+- 长图全局缩略图、重叠 tile、全局布局、坐标回映和跨 tile OCR 去重基础；
+- 不可覆盖的运行日志；
+- 配置快照、Git 提交、依赖快照和 transform fingerprint；
+- 断点续跑和历史产物迁移。
 
-### 阶段 3：OCR 和视觉信息抽取
+### 阶段 2.5：最小人工标注与评估工具
+
+在正式模型批处理前完成：
+
+- 角色、代表色资格、mask 和多色号配对标注；
+- 固定评估集版本化与 SHA256/产品分组防泄漏；
+- 内容标签页面隐藏当前 SKU/folder/context shade；
+- 首轮标注和 Pilot 基线；
+- `provisional_target` 评审及版本化冻结候选。
+
+完整多用户审核、优先级队列和持续学习仍在阶段 8。
+
+### 阶段 3：内容视觉分析与 occurrence 来源上下文融合
+
+完成：
+
+- A 层 `content_visual_analyses`：不含当前 SKU/folder/context shade 的角色、布局和资格；
+- B 层 `occurrence_context_fusions`：结合 folder、CSV、SKU、context shade 判断与当前商品的关系；
+- 两层独立缓存、版本、表和评估；
+- 请求、原始响应、解析/Schema 状态双留存；
+- 角色与资格 Precision/Recall/F1/Coverage 报告。
+
+### 阶段 4：OCR 和视觉信息抽取
 
 完成：
 
 - OCR 文本框；
+- shade-code exact match 和 CER；
+- 长图跨 tile OCR 去重与原图坐标回映；
 - VLM 实体抽取；
 - 文件夹名称解析；
 - 证据表；
 - 冲突检测。
 
-### 阶段 4：单色图代表色提取
+### 阶段 5：单色图 image-observed 代表色提取
 
 优先实现：
 
 - 单色试色图；
 - 单色膏体图；
 - 色卡图；
-- mask 和颜色诊断输出。
+- mask 和颜色诊断输出；
+- Median/P90 ΔE00 评估；
+- `color_semantics=image_observed_representative`。
 
-### 阶段 5：多色号图
+### 阶段 6：多色号图
 
 完成：
 
 - 多区域检测；
 - OCR 版面理解；
 - 色号—名称—色块匹配；
-- 每个色号独立颜色候选。
+- 每个色号独立颜色候选；
+- 多色号整图完全匹配率；
+- 全局布局约束下的长图 tile 合并。
 
-### 阶段 6：商品级融合和数据库
+### 阶段 7：商品级融合和数据库
 
 完成：
 
@@ -1464,15 +1674,17 @@ Codex 必须建立固定评估集，不允许只看几个示例图。
 - 实体归一化；
 - 新色号候选；
 - 在阶段 1 最小数据库之上完成知识层表；
+- 每商品至少一个有效颜色证据覆盖率；
 - 查询和导出接口。
 
-### 阶段 7：人工审核和持续学习
+### 阶段 8：完整人工审核和持续学习
 
 完成：
 
-- 审核任务导出；
-- 审核结果回写；
+- 在阶段 2.5 最小工具上增加任务分配、权限、并发、优先级和裁决；
+- 审核任务导出与结果回写；
 - 标注数据集版本化；
+- 版本化评估、回归和阈值管理；
 - 本地模型训练准备。
 
 ---
@@ -1552,15 +1764,19 @@ preprocessing:
 
 classification:
   prompt_version: "1.0.0"
-  low_confidence_threshold: 0.70
 
 color:
   working_space: "CIELAB"
   delta_e_method: "CIEDE2000"
-  min_valid_pixels: 1000
   save_masks: true
   save_overlays: true
   save_color_patches: true
+
+thresholds:
+  status: "provisional_target"
+  threshold_version: "draft_after_audit"
+  classification_low_confidence: 0.70
+  color_min_valid_pixels: 1000
 
 review:
   export_format: "jsonl"
@@ -1568,7 +1784,7 @@ review:
   include_raw_model_response: true
 ```
 
-阈值必须放在配置中，不要散落在代码里。
+阈值必须放在配置中，不要散落在代码里。首轮标注和阶段 1.5 Pilot 前，所有模型/算法性能阈值的 `status` 必须是 `provisional_target`；评审冻结后创建新的 `threshold_version`，不能原地改写。
 
 ---
 
@@ -1582,7 +1798,9 @@ review:
 - ID 稳定性；
 - Data URL 编码；
 - JSON 修复与 Schema 校验；
+- A 层请求上下文白名单与 A/B 缓存键隔离；
 - 坐标转换；
+- 全局缩略图、重叠 tile、跨 tile OCR 去重和原图坐标回映；
 - sRGB/Lab/HEX 转换；
 - ΔE00；
 - OCR 文本归一化；
@@ -1606,6 +1824,8 @@ review:
 
 集成测试不应默认真实调用付费 API。使用缓存响应或 mock；另提供显式的在线测试命令。
 
+正式阶段 3 前另执行 50–100 个唯一 SHA256 的阶段 1.5 在线 Pilot，覆盖八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞。内容角色核查时默认隐藏当前 SKU、folder 目标色号和 `context_shade`。
+
 ### 22.3 回归测试
 
 每次修改提示词、分割算法、颜色算法或融合规则后，输出：
@@ -1625,7 +1845,8 @@ review:
 
 - 原始图片路径；
 - 标准化分析图；
-- 图片角色 JSON；
+- A 层内容视觉分析 JSON；
+- B 层 occurrence 来源上下文融合 JSON；
 - OCR JSON；
 - VLM 原始响应；
 - 检测框 overlay；
@@ -1671,7 +1892,10 @@ outputs/runs/{run_id}/
 9. 低置信度必须审核；
 10. 所有模型、规则、提示词和数据库结构都要版本化；
 11. 允许 Codex 根据数据修改实现，但必须有审计、变更记录和回归对比；
-12. 第一版应优先形成稳定、可审计的流水线，再追求复杂模型和端到端自动化。
+12. 内容视觉事实与 occurrence 来源上下文必须分层，A 层不得接收当前 SKU/folder/context shade；
+13. 长图同时保留全局缩略图与重叠 tile，并保存 OCR 去重和原图坐标链；
+14. 数据库颜色是 image-observed representative color，无校准证据时不得声称真实物理颜色；
+15. 第一版应优先形成稳定、可审计的流水线，再追求复杂模型和端到端自动化。
 
 ---
 
@@ -1686,11 +1910,14 @@ Codex 接收本指南后，应按以下顺序执行：
 5. 创建 `docs/repository_audit.md`；
 6. 创建或更新 `docs/implementation_plan.md`；
 7. 在本指南“变更记录”中记录第一轮修订；
-8. 优先复用已有可用模块；
-9. 先完成 manifest、模型调用封装和角色分类最小闭环；
-10. 用固定小样本验证后再扩大批处理；
-11. 每完成一个阶段，生成可视化和评估报告；
-12. 不得在没有证据的情况下声称整个数据集已经正确处理。
+8. 先完成阶段 0.5 明文密钥处置，未通过不得进入后续阶段；
+9. 优先复用已有可用模块；
+10. 先完成 SQLite + JSONL manifest 和稳定 ID；
+11. 用 50–100 个唯一 SHA256 完成阶段 1.5 VLM Pilot；
+12. 加固预处理并建立阶段 2.5 最小标注/固定评估集；
+13. 冻结有证据的阈值版本后再扩大 A/B 两层分析；
+14. 每完成一个阶段，生成可视化和评估报告；
+15. 不得在没有证据的情况下声称整个数据集已经正确处理。
 
 ---
 
@@ -1710,5 +1937,46 @@ Codex 接收本指南后，应按以下顺序执行：
     - `image_preprocessing_pipeline/preprocess_product_images.py:402`：现有路径相关 `image_id`；
     - `download_product_images.py:151`：Windows 双斜杠 URL 后缀识别问题。
   - 兼容性影响：八类核心角色标签、原图只读、模型原始/解析双留存和 `image_id=SHA256` 底线不变；现有预处理 `image_id` 迁移为 `legacy_image_id`，原始目录只生成 `folder_group_id`，不再直接充当最终 `product_id`。正式实现必须提供迁移映射，不覆盖旧元数据。
+  - 修改人/代理：Codex。
+- 2026-07-28：
+  - 修改章节：1、4.1–4.2、5.4、6.2–6.6、7、9、11–15、17–19、22–25。
+  - 修改内容：
+    - 新增阶段 0.5 安全阻断项：轮换/吊销泄露 Key、从受跟踪代码移除、采用未跟踪 `.env`/环境变量、执行密钥扫描，并在已推送时检查远程可达 Git 历史；
+    - 明确当前 CSV + 当前下载器只能重建当前路径关系；没有不可变成功 manifest 时不能保证长期稳定追溯；
+    - 将模型分析拆为 A 层 `content_visual_analyses` 与 B 层 `occurrence_context_fusions`；A 层禁止输入当前 SKU、folder 目标色号和 `context_shade`；
+    - 增加阶段 1.5 的 50–100 唯一 SHA256 VLM Pilot，以及阶段 2.5 最小标注/固定评估集；完整审核系统保留在阶段 8；
+    - 阶段 1 存储门禁改为 SQLite + JSONL，Parquet/全量 CSV 镜像后置为可选导出；
+    - 所有性能候选值标记 `provisional_target`，补充资格 Precision/Recall/F1/Coverage、每商品颜色证据覆盖率、OCR shade-code exact match/CER、颜色 Median/P90 ΔE00 和多色号整图完全匹配率；
+    - 明确数据库颜色是 `image-observed representative color`，将含义不清的 `corrected_*` 改为 `normalized_*`；无可验证校准依据时不得声称真实物理颜色；
+    - 长图改为全局缩略图 + 重叠 tile，保存全局布局、tile 坐标、跨 tile OCR 去重链和原图坐标回映。
+  - 修改原因：降低上下文标签泄漏和重复付费风险；在正式批处理前验证模型/Schema/持久化闭环并建立固定真值；避免把当前可重建路径、图像观测色和小样本候选阈值误表述为更强的事实。
+  - 证据来源：
+    - `docs/repository_audit.md` 4.4：当前 31,513 条 URL 引用可由当前 CSV/下载器重建为 31,511 个目标路径，但下载器没有不可变成功 manifest；
+    - `test_qwen36_vision.py:21`：受 Git 跟踪文件中存在明文 API Key；
+    - `docs/repository_audit.md` 4.2–4.3：9 组品牌目录别名、16 个目录碰撞组涉及 48 个源行；
+    - `docs/repository_audit.md` 5.1、5.3、6：229 个扩展名/真实格式错配；存在 1074×28190 整页长图和 750×1 装饰条；
+    - `docs/repository_audit.md` 7.2–7.3：31,511 个文件只有 12,386 个唯一 SHA256，精确重复额外文件占 60.69%，且现有路径相关 ID 与内容 ID 语义不同；
+    - `preprocess_product_images.py:402-404`：现有 `image_id` 包含路径哈希；`test_qwen36_vision.py` 当前只打印响应且没有 Schema/双留存闭环。
+  - 兼容性影响：
+    - 原始目标、八类核心角色代码、原图只读、`image_id=SHA256`、模型原始/解析双留存和证据追溯底线均保留；
+    - 内容表规范名统一为 `image_contents`；旧草案名 `images` 仅为文档别名，迁移必须显式；
+    - 不再创建可写的混合 `image_roles` 表；旧设计字段须显式迁移到 A/B 两表，必要兼容 view 只能只读并标明来源；
+    - `corrected_* → normalized_*` 是显式字段迁移，旧输出不得静默重解释；真正校准颜色只能另用有证据的 `calibrated_*`；
+    - 阶段号和门禁扩展为 0.5、1.5、2.5；详细迁移和验收以 `docs/implementation_plan.md` 2026-07-28 修订版为准。
+  - 修改人/代理：Codex。
+- 2026-07-28（阶段 0.5/1 实施状态回写）：
+  - 修改章节：16 的阶段 0.5/1 状态说明、26 变更记录。
+  - 修改原因：阶段 0.5 和阶段 1 已实际执行；需要区分原始安全目标、所有者明确豁免和已经验证的结果，避免继续把文档修订轮次的“尚未实现”当作当前状态。
+  - 代码证据：
+    - `.gitignore`、`.env.example`、`lipcolor_pipeline/config.py`；
+    - `lipcolor_pipeline/security.py` 与 `scripts/scan_secrets.py`；
+    - `database/migrations/001_stage1.sql`；
+    - `lipcolor_pipeline/stage1_manifest.py`、`lipcolor_pipeline/stage1_validate.py` 及其 CLI；
+    - `tests/test_security.py`、`tests/test_stage1_manifest.py`。
+  - 数据证据：
+    - `stage1_full_20260728`：2,309 个 source record、31,513 个 source ref、31,511 个 occurrence、12,386 个内容 SHA256、31,513 条来源关系；
+    - 16 个目录碰撞组和 9 个品牌别名组保留；SQLite/JSONL 主键与行数一致；原图全集 stat 和两轮各 100 张 SHA256 抽样通过。
+  - 安全证据：目标脚本路径在当前树和全部本地可达对象中无结果，远端 `main` 已带租约重写；三层扫描 0 条发现且正向 fixture 有效。供应商失效状态未验证，记录为 `owner_waived_unverified`。
+  - 兼容性影响：总体目标、核心标签、数据库语义、原图只读、模型双留存和后续 1.5/2/2.5 阶段设计均不变；只回写实际完成状态和显式例外。
   - 修改人/代理：Codex。
 - 后续由 Codex 根据仓库审计、固定评估集和真实数据分析继续维护。
