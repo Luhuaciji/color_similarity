@@ -1,0 +1,59 @@
+input:
+  supported_extensions:
+    - .jpg
+    - .jpeg
+    - .png
+    - .webp
+    - .tif
+    - .tiff
+    - .bmp
+
+output:
+  # true：在 output/original_copies 中保留逐字节副本，并从副本执行处理。
+  copy_originals: true
+  overwrite: false
+  working_format: png
+  save_csv: true
+  save_jsonl: true
+
+color_management:
+  target_color_space: sRGB
+  missing_profile_policy: assume_srgb
+  invalid_profile_policy: fallback_and_flag
+  rendering_intent: perceptual
+
+alpha:
+  save_alpha_mask: true
+  display_background: white
+  exclude_transparent_pixels: true
+  # 质量统计时 alpha >= 1 的像素视为有效；Alpha Mask 保留完整 0~255 值。
+  valid_alpha_threshold: 1
+
+deduplication:
+  calculate_sha256: true
+  calculate_phash: true
+  calculate_dhash: true
+  phash_high_confidence_distance: 4
+  phash_possible_duplicate_distance: 8
+
+quality:
+  calculate_blur_score: true
+  calculate_exposure_metrics: true
+  analysis_max_side: 1024
+  low_resolution_short_edge: 256
+  medium_resolution_short_edge: 512
+  blur_warning_threshold: 50.0
+  dark_pixel_threshold: 30
+  bright_pixel_threshold: 225
+  dark_ratio_warning_threshold: 0.60
+  bright_ratio_warning_threshold: 0.60
+  mostly_transparent_threshold: 0.95
+
+processing:
+  continue_on_error: true
+  num_workers: 4
+  processing_version: "1.1.0"
+  max_image_pixels: 200000000
+  allow_truncated_images: false
+  selected_frame: 0
+  verify_original_copy_sha256: true

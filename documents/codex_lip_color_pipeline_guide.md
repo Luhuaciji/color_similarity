@@ -1,0 +1,1563 @@
+# 口红/唇部彩妆图片理解、代表色提取与色号知识数据库构建指南
+
+> 文档定位：供 Codex 在现有项目仓库和真实数据集上进行代码审计、架构设计、实现、测试和持续修订。
+>
+> 适用数据：多品牌、多产品、多图片的口红、唇膏、唇彩、唇蜜、唇釉等商品图片。每个商品文件夹包含若干图片，图片可能为膏体图、试色图、唇部效果图、多色号对比图、色卡、包装图、文字宣传图或无效图。
+>
+> 当前视觉大模型：`qwen3.6-plus`
+>
+> OpenAI 兼容 Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
+>
+> 完整请求端点：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
+
+---
+
+## 1. 总体目标
+
+构建一条可复现、可审计、可扩展的处理流水线，从商品文件夹中的原始图片出发，完成：
+
+1. 图片角色分类；
+2. 判断图片是否适合提取商品代表色；
+3. 对适合的图片定位有效颜色区域并提取代表色；
+4. 检测并提取图片中的文字信息；
+5. 从多色号对比图中识别多个色块、膏泥或试色区域，并与对应的色号文字建立空间关系；
+6. 融合文件夹名称、图片内容、OCR、视觉大模型结果和像素颜色结果；
+7. 建立品牌、商品、系列、色号、图片证据、代表色和描述属性之间的知识数据库；
+8. 生成低置信度和冲突样本，供人工审核；
+9. 将人工审核结果回流到规则、提示词、分类器和后续监督学习数据中。
+
+目标流水线：
+
+```text
+商品文件夹
+    │
+    ├── 文件夹名称解析
+    ├── 图片读取、去重、质量检测
+    │
+    ▼
+图片角色分类
+    │
+    ├── 单色膏体图
+    ├── 单色试色图
+    ├── 唇部效果图
+    ├── 多色号对比图
+    ├── 色卡/色块图
+    ├── 包装图
+    ├── 文字宣传图
+    └── 无效图
+    │
+    ├──────────────────────┐
+    ▼                      ▼
+代表色提取流水线           信息抽取流水线
+    │                      │
+区域检测与分割             OCR文字检测
+    │                      │
+颜色校正与像素过滤         视觉大模型结构化理解
+    │                      │
+Lab聚类与代表色计算         色号—名称—色块空间匹配
+    │                      │
+多图片颜色融合             文件夹名称与图片信息融合
+    │                      │
+置信度和异常检测           实体归一化与新色号发现
+    └──────────┬───────────┘
+               ▼
+       商品色号知识数据库
+               │
+               ▼
+       人工审核与持续学习
+```
+
+---
+
+## 2. Codex 的工作方式
+
+本指南是“可修订的规范”，不是不可修改的静态需求。Codex 必须先审计项目，再实施代码，并在真实证据支持下修订本指南。
+
+### 2.1 开始编码前必须执行的审计
+
+Codex 应先完成以下检查：
+
+1. 扫描仓库目录结构、现有脚本、配置文件、数据库文件和历史输出；
+2. 统计商品文件夹数量、图片总数、扩展名分布、图片尺寸分布、文件大小分布和损坏文件数量；
+3. 抽样检查各品牌、各商品和各图片类型；
+4. 检查是否已有 SHA256、pHash、EXIF、ICC、sRGB 转换、质量检测或错误日志；
+5. 检查现有代码是否已经定义商品 ID、图片 ID、色号 ID 和输出目录；
+6. 检查 API 调用封装、环境变量、重试、缓存、并发和费用统计是否已存在；
+7. 查找历史运行中已知问题，例如截断图片、颜色配置文件异常、透明通道、超大图片或内容审核失败；
+8. 输出一份仓库审计报告，再开始修改代码。
+
+建议生成：
+
+```text
+docs/repository_audit.md
+docs/data_profile.md
+docs/implementation_plan.md
+```
+
+### 2.2 允许 Codex 修改本指南的条件
+
+Codex 可以根据项目文件和真实数据修改本指南，但必须遵守以下规则：
+
+- 不得静默修改核心标签语义、数据库主键、原始数据保留策略或审计要求；
+- 所有实质性修改必须记录变更原因和证据；
+- 如果真实项目已有成熟结构，应优先兼容现有结构，而不是机械重建；
+- 如果数据分布与本文假设不符，应更新标签、阈值、字段或阶段划分；
+- 如果某种方案在样本上效果差，可以替换，但必须保留对比实验或失败记录；
+- 如果修改会破坏旧输出兼容性，必须提供迁移脚本或版本转换说明。
+
+每次修订本指南时，在文末维护：
+
+```text
+## 变更记录
+- 日期
+- 修改章节
+- 修改内容
+- 证据来源
+- 兼容性影响
+- 修改人/代理
+```
+
+重大架构变更建议使用 ADR：
+
+```text
+docs/decisions/ADR-0001-xxx.md
+```
+
+### 2.3 不允许被取消的底线约束
+
+以下约束不得因实现方便而删除：
+
+1. 原始图片只读保存，不覆盖；
+2. 所有派生结果可追溯到原始图片；
+3. 所有模型结果记录模型名、提示词版本、参数、时间和错误；
+4. 代表色不能只依赖视觉大模型直接生成的 HEX；
+5. 多色号图必须保留“文字—色块—空间位置”证据；
+6. 低置信度结果必须进入审核队列，不能强行写成确定事实；
+7. 所有自动决策必须有置信度、规则版本或模型版本；
+8. 同一输入和相同版本配置应尽可能得到一致结果；
+9. 任何人工修改都必须留痕；
+10. 数据库必须区分“原始证据”“模型推断”“融合结论”和“人工确认”。
+
+---
+
+## 3. 推荐项目结构
+
+Codex 应优先适配现有仓库。如果仓库尚无明确结构，可参考：
+
+```text
+project_root/
+├── README.md
+├── pyproject.toml
+├── requirements.txt
+├── .env.example
+├── configs/
+│   ├── pipeline.yaml
+│   ├── labels.yaml
+│   ├── prompts/
+│   │   ├── image_role_v1.txt
+│   │   ├── image_understanding_v1.txt
+│   │   └── multi_shade_matching_v1.txt
+│   └── thresholds.yaml
+├── src/
+│   └── lipcolor_pipeline/
+│       ├── cli.py
+│       ├── config.py
+│       ├── logging_utils.py
+│       ├── ids.py
+│       ├── inventory/
+│       ├── preprocessing/
+│       ├── classification/
+│       ├── vlm/
+│       ├── ocr/
+│       ├── detection/
+│       ├── segmentation/
+│       ├── color/
+│       ├── matching/
+│       ├── fusion/
+│       ├── database/
+│       ├── review/
+│       └── evaluation/
+├── scripts/
+│   ├── audit_dataset.py
+│   ├── run_pipeline.py
+│   ├── export_review_batch.py
+│   └── migrate_database.py
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   └── fixtures/
+├── docs/
+│   ├── repository_audit.md
+│   ├── data_profile.md
+│   ├── implementation_plan.md
+│   └── decisions/
+├── data/
+│   ├── raw/                 # 原始图片，只读
+│   ├── manifests/
+│   ├── cache/
+│   ├── interim/
+│   ├── processed/
+│   ├── review/
+│   └── database/
+└── outputs/
+    ├── logs/
+    ├── reports/
+    ├── overlays/
+    ├── color_patches/
+    └── failed/
+```
+
+---
+
+## 4. 核心数据对象与 ID 设计
+
+所有处理阶段必须围绕稳定 ID 工作，禁止依赖易变的绝对路径作为唯一标识。
+
+### 4.1 推荐 ID
+
+- `brand_id`：标准化品牌 ID；
+- `product_id`：商品级 ID；
+- `shade_id`：色号级 ID；
+- `image_id`：图片级 ID；
+- `region_id`：图中区域级 ID；
+- `ocr_span_id`：OCR 文本框 ID；
+- `run_id`：流水线运行 ID；
+- `model_run_id`：模型调用 ID；
+- `review_task_id`：人工审核任务 ID。
+
+建议：
+
+```text
+image_id = SHA256(原始文件字节)
+product_id = UUIDv5(标准化品牌 + 标准化商品文件夹相对路径)
+region_id = UUIDv5(image_id + 区域类型 + 坐标 + 算法版本)
+```
+
+同一字节完全一致的图片使用同一 `image_id`，但保留多个来源路径记录。
+
+### 4.2 Manifest 是流水线入口
+
+第一阶段生成统一 manifest，至少包含：
+
+```json
+{
+  "image_id": "sha256...",
+  "source_path": "品牌/商品/图片.jpg",
+  "brand_folder": "品牌",
+  "product_folder": "商品",
+  "filename": "图片.jpg",
+  "extension": ".jpg",
+  "byte_size": 123456,
+  "width": 1200,
+  "height": 1200,
+  "exif_orientation": 1,
+  "icc_profile_present": true,
+  "decode_status": "ok",
+  "sha256": "...",
+  "phash": "...",
+  "duplicate_group_id": null,
+  "created_at": "ISO-8601"
+}
+```
+
+建议使用 Parquet 作为批处理主表，同时可导出 JSONL/CSV 供人工查看。
+
+---
+
+## 5. 图片读取、预处理、去重与质量检测
+
+虽然本指南重点从图片角色分类开始，但后续结果依赖稳定的预处理输入，因此 Codex 必须复用或补全以下能力。
+
+### 5.1 读取与容错
+
+- 处理 EXIF Orientation；
+- 尝试严格解码；
+- 对 `image file is truncated` 等错误记录到错误表；
+- 是否启用 Pillow 的截断容错必须配置化；
+- 容错解码成功的图片要标记 `decode_recovered=true`；
+- 不允许悄悄跳过错误文件；
+- 记录原始格式、颜色模式、透明通道和动画帧信息。
+
+### 5.2 色彩空间
+
+- 保留原图；
+- 派生分析图统一为 sRGB；
+- 有 ICC 时执行受控颜色转换；
+- 无 ICC 时记录“按 sRGB 假设”；
+- 透明图片需要定义背景合成策略，默认输出白底和棋盘格诊断版本；
+- 不要为了“看起来更鲜艳”进行不可追溯的增强；
+- 所有颜色计算必须明确基于哪个派生版本。
+
+### 5.3 去重
+
+- SHA256：识别字节完全相同图片；
+- pHash/dHash：识别缩放、压缩、裁剪或轻度编辑的近重复图片；
+- 只对完全重复图片直接复用模型结果；
+- 近重复图片可共享候选结果，但必须保留独立质量和颜色分析；
+- 不应仅因近似重复而删除可能含不同文字、裁剪或色彩变化的图片。
+
+### 5.4 质量指标
+
+至少记录：
+
+- 分辨率；
+- 长宽比；
+- 模糊度；
+- 过曝比例；
+- 欠曝比例；
+- 高光比例；
+- 有效像素比例；
+- 压缩伪影指标；
+- 纯色边框或大面积白底比例；
+- 图片是否过小；
+- 图片是否严重截断。
+
+质量分数不能直接决定代表色，只作为角色分类和代表色置信度的特征。
+
+---
+
+## 6. 图片角色分类
+
+### 6.1 标签体系
+
+推荐使用稳定英文代码和中文显示名：
+
+| role_code | 中文名称 | 定义 |
+|---|---|---|
+| `single_bullet` | 单色膏体图 | 单一色号口红膏体、唇膏棒、膏体近景 |
+| `single_swatch` | 单色试色图 | 单一色号在手臂、纸面、板面或其他基底上的试色 |
+| `lip_effect` | 唇部效果图 | 真人或模型唇部上妆效果 |
+| `multi_shade_comparison` | 多色号对比图 | 同图包含多个色号的膏体、膏泥、试色或唇部对比 |
+| `color_card` | 色卡/色块图 | 规则排列的色块、色卡、色谱或数字色块 |
+| `packaging` | 包装图 | 外壳、纸盒、瓶体、管体、品牌包装为主体 |
+| `text_promo` | 文字宣传图 | 文字、卖点、成分、色号描述占主导 |
+| `invalid` | 无效图 | 非目标商品、严重损坏、无法识别、纯装饰、无有效信息 |
+
+### 6.2 主标签与辅助标签
+
+真实图片可能同时具备多种属性，例如“多色号对比图 + 大量文字”。因此不要只保留一个字符串。
+
+建议输出：
+
+- `primary_role`：主角色；
+- `secondary_roles`：辅助角色列表；
+- `contains_text`；
+- `contains_multiple_shades`；
+- `contains_lips`；
+- `contains_skin_swatch`；
+- `contains_product_bullet`；
+- `contains_packaging`；
+- `representative_color_eligible`；
+- `information_extraction_eligible`。
+
+### 6.3 视觉大模型结构化输出
+
+`qwen3.6-plus` 负责：
+
+- 图片角色分类；
+- 场景和对象识别；
+- 判断是否存在多个色号；
+- 判断是否含文字；
+- 估计可用于颜色提取的区域类型；
+- 给出候选区域的归一化边界框；
+- 识别遮挡、高光、滤镜、拼贴、文字覆盖等风险；
+- 输出结构化理由和置信度。
+
+视觉大模型不负责最终权威 HEX。其颜色名称或 HEX 仅作为语义参考和异常对照。
+
+建议输出 JSON：
+
+```json
+{
+  "schema_version": "1.0",
+  "primary_role": "single_swatch",
+  "secondary_roles": ["text_promo"],
+  "role_confidence": 0.94,
+  "contains_text": true,
+  "contains_multiple_shades": false,
+  "representative_color_eligible": true,
+  "eligibility_confidence": 0.91,
+  "candidate_color_regions": [
+    {
+      "region_type": "swatch",
+      "bbox_norm": [0.18, 0.22, 0.74, 0.83],
+      "confidence": 0.92,
+      "risks": ["specular_highlight"]
+    }
+  ],
+  "observed_objects": ["forearm", "lipstick swatch"],
+  "quality_risks": ["warm lighting"],
+  "reason": "图中主要区域为单一手臂试色，颜色面积较大且与背景可分离。"
+}
+```
+
+### 6.4 提示词要求
+
+提示词应：
+
+- 明确定义每个角色；
+- 要求只输出 JSON；
+- 明确坐标格式为 `[x_min, y_min, x_max, y_max]`，范围 0–1；
+- 要求不确定时降低置信度；
+- 不允许将包装颜色当作膏体代表色；
+- 不允许将文字背景色直接当作商品色；
+- 对多色号图必须报告色号数量估计和布局类型；
+- 对唇部效果图必须报告皮肤、牙齿、高光、阴影和滤镜风险。
+
+提示词必须版本化，例如：
+
+```text
+prompt_name=image_role
+prompt_version=1.0.0
+```
+
+### 6.5 分类实现策略
+
+第一版可以采用：
+
+1. 规则预筛选；
+2. `qwen3.6-plus` 结构化分类；
+3. 本地轻量分类器或人工标注数据形成后再替换高频调用；
+4. 大模型用于困难样本和抽样复核。
+
+长期建议形成级联：
+
+```text
+快速本地分类器 → 高置信度直接通过
+                  ↓低置信度
+             qwen3.6-plus
+                  ↓冲突/低置信度
+               人工审核
+```
+
+---
+
+## 7. 代表色提取资格判断
+
+图片角色和“是否适合代表色提取”不是同一概念。
+
+### 7.1 通常优先级
+
+一般优先级可设为：
+
+```text
+单色试色图 ≈ 单色膏体图 > 色卡/色块图 > 多色号对比图 > 唇部效果图
+```
+
+包装图和纯文字宣传图通常不参与代表色计算，但可用于文字和商品信息提取。
+
+### 7.2 适合提取的条件
+
+- 有明确、足够大的颜色区域；
+- 颜色区域属于膏体、膏泥、试色或明确色块；
+- 区域没有被大面积文字、反光、阴影或遮挡覆盖；
+- 图片没有严重滤镜或色偏；
+- 目标颜色不是包装、背景或装饰色；
+- 多色号图中各颜色区域可分割并能与文字匹配；
+- 唇部效果图中能较稳定分离唇部区域。
+
+### 7.3 不适合或低权重的情况
+
+- 包装颜色与膏体颜色混淆；
+- 膏体面积过小；
+- 高光覆盖膏体主体；
+- 黑底或强色光环境；
+- 大量美颜、滤镜、磨皮；
+- 唇部边界不清晰；
+- 手臂试色混有肤色且无法分离；
+- 拼贴图被压缩或缩放严重；
+- 色块只是设计元素，不是实际色号；
+- 图中同一色号出现多个不一致版本。
+
+### 7.4 资格输出
+
+每张图片至少输出：
+
+```json
+{
+  "eligible": true,
+  "eligibility_score": 0.87,
+  "recommended_strategy": "single_swatch_segmentation",
+  "rejection_reasons": [],
+  "weight_hint": 0.9
+}
+```
+
+---
+
+## 8. 区域检测与分割
+
+### 8.1 设计原则
+
+视觉大模型提供“在哪里”，像素算法负责“精确到哪些像素”。不要将粗边界框直接作为最终代表色区域。
+
+### 8.2 按图片角色处理
+
+#### 单色膏体图
+
+- 检测膏体主体；
+- 排除管体、底座、品牌文字和背景；
+- 对圆柱或斜面膏体，排除高光带和极暗边缘；
+- 优先取膏体中部、低高光、低阴影区域；
+- 保存分割 mask 和可视化 overlay。
+
+#### 单色试色图
+
+- 检测试色块；
+- 与皮肤或基底分离；
+- 可利用局部色差、边缘和饱和度变化；
+- 对渐变试色，记录中心色、深色端和浅色端；
+- 最终代表色一般使用稳健中心或面积加权 medoid。
+
+#### 唇部效果图
+
+- 分割唇部；
+- 排除皮肤、牙齿、口腔、强高光和阴影；
+- 可进一步区分上唇、下唇和高光区；
+- 因肤色、相机和滤镜影响较大，默认权重低于膏体/试色；
+- 建议保留原始唇色估计风险字段。
+
+#### 多色号对比图
+
+- 检测每个独立膏泥、试色、膏体或色块；
+- 给每个区域单独建立 `region_id`；
+- 记录布局：网格、横向、纵向、环形、任意布局；
+- 每个区域单独颜色计算；
+- 再与 OCR 文本进行空间匹配。
+
+#### 色卡/色块图
+
+- 检测规则色块；
+- 排除边框、文字、阴影和渐变背景；
+- 检查色块是否为真实色号展示，而非装饰色；
+- 可利用矩形检测、轮廓、网格和重复尺寸。
+
+### 8.3 算法选择
+
+第一版可组合：
+
+- OpenCV 轮廓、颜色阈值、GrabCut、超像素；
+- 基于 VLM 边界框的局部分割；
+- SAM/SAM2 或其他分割模型；
+- 对规则色块使用几何检测；
+- 对唇部使用人脸关键点和唇部语义分割。
+
+Codex 应通过小规模标注集比较方案，而不是预设某一个模型一定最好。
+
+---
+
+## 9. 颜色校正、像素过滤与代表色计算
+
+### 9.1 基本原则
+
+- 代表色来自图像像素计算；
+- 视觉大模型生成的 HEX 只能作为候选或一致性检查；
+- 颜色计算默认在 sRGB 派生图上进行；
+- 聚类和色差计算使用 CIE Lab；
+- 所有结果保留原始 RGB、sRGB HEX、Lab 和算法版本。
+
+### 9.2 不要进行无依据的全局白平衡
+
+电商图经常经过后期处理。如果没有灰卡、色卡或可靠白色参考，不应自动进行强白平衡并把结果当作真实商品颜色。
+
+建议保存：
+
+- `raw_srgb_color`：统一 sRGB 后的结果；
+- `corrected_color`：只有在有明确校正依据时生成；
+- `correction_method`；
+- `correction_confidence`。
+
+### 9.3 像素过滤
+
+按角色配置过滤规则：
+
+- 排除透明像素；
+- 排除近白背景；
+- 排除近黑阴影；
+- 排除极高亮高光；
+- 排除边缘混合像素；
+- 排除低置信度分割区域；
+- 对裸色、棕色、灰调色不能使用过强的低饱和过滤；
+- 对唇釉和亮面产品，不能把所有高亮像素删除，应保留主体色并单独记录光泽特征。
+
+### 9.4 Lab 聚类
+
+建议：
+
+1. 将有效像素转换为 Lab；
+2. 进行抽样以控制速度；
+3. 使用 KMeans、GMM、HDBSCAN 或基于 ΔE00 的聚类；
+4. 排除明显背景簇、高光簇和阴影簇；
+5. 对剩余候选簇按面积、中心位置、饱和度稳定性和角色先验评分；
+6. 选择 medoid 或稳健中心作为代表色；
+7. 计算簇内离散度、有效像素数量和不确定性。
+
+建议输出：
+
+```json
+{
+  "representative_hex": "#A84F5B",
+  "rgb": [168, 79, 91],
+  "lab": [46.8, 37.2, 14.1],
+  "method": "lab_kmeans_medoid_v1",
+  "valid_pixel_count": 38542,
+  "dominant_cluster_ratio": 0.72,
+  "within_cluster_delta_e_p50": 2.7,
+  "within_cluster_delta_e_p95": 7.8,
+  "color_confidence": 0.88
+}
+```
+
+### 9.5 代表色不是“出现面积最大的颜色”
+
+最大面积颜色可能是：
+
+- 白色背景；
+- 黑色包装；
+- 肤色；
+- 阴影；
+- 高光；
+- 宣传图底色。
+
+必须先由角色分类和区域分割确定语义目标，再计算颜色。
+
+---
+
+## 10. OCR 与文字信息提取
+
+### 10.1 OCR 分层设计
+
+建议同时保留：
+
+1. OCR 引擎的原始文本框、坐标和置信度；
+2. 视觉大模型对文本语义和版面关系的理解；
+3. 归一化后的品牌、系列、色号编号、色号名称和描述属性。
+
+可用 OCR 包括 PaddleOCR 等。本项目不应仅依赖视觉大模型“读图后口述”，因为需要精确坐标和可审计文本框。
+
+### 10.2 OCR 原始记录
+
+```json
+{
+  "ocr_span_id": "...",
+  "image_id": "...",
+  "text_raw": "N19 白桃生巧色",
+  "text_normalized": "N19 白桃生巧色",
+  "bbox_norm": [0.12, 0.08, 0.35, 0.14],
+  "confidence": 0.96,
+  "language": "zh",
+  "engine": "paddleocr",
+  "engine_version": "..."
+}
+```
+
+### 10.3 需要抽取的实体
+
+- 品牌；
+- 商品系列；
+- 产品类型；
+- 色号编号；
+- 色号名称；
+- 英文别名；
+- 中文别名；
+- 颜色描述；
+- 冷暖调；
+- 明度或深浅；
+- 质地，如哑光、镜面、水光、奶油、丝绒；
+- 适用肤色；
+- 适用场景；
+- 宣传卖点；
+- 容量或规格；
+- 图中是否明确表示“实拍”“试色”“仅供参考”等限制。
+
+模型必须区分：
+
+- 图片中明确写出的事实；
+- 根据图像推断出的属性；
+- 文件夹名称提供的信息；
+- 数据库已有信息；
+- 人工确认的信息。
+
+---
+
+## 11. 多色号图中的“色号—名称—色块”空间匹配
+
+这是信息抽取中最关键且容易出错的部分。
+
+### 11.1 输入对象
+
+- 色块、膏泥、试色或膏体区域列表；
+- OCR 文本框列表；
+- VLM 提供的布局与阅读顺序；
+- 可能存在的连接线、编号、箭头、表格结构；
+- 文件夹和商品系列上下文。
+
+### 11.2 匹配方法
+
+构建候选边：
+
+- 文本框与色块的中心距离；
+- 上下左右相对位置；
+- 是否处于同一网格单元；
+- 是否有连接线或邻近编号；
+- 阅读顺序；
+- 文本是否符合色号格式；
+- 系列内已知色号名称；
+- VLM 对配对关系的判断。
+
+然后使用：
+
+- 规则评分；
+- 匈牙利算法；
+- 二分图匹配；
+- 图优化；
+- 对复杂布局使用 VLM 结构化复核。
+
+### 11.3 输出
+
+```json
+{
+  "region_id": "region-01",
+  "shade_code": "N19",
+  "shade_name": "白桃生巧色",
+  "linked_ocr_span_ids": ["ocr-03", "ocr-04"],
+  "match_score": 0.93,
+  "match_method": "grid_plus_vlm_v1",
+  "ambiguity": false,
+  "alternative_matches": []
+}
+```
+
+### 11.4 不确定性处理
+
+以下情况必须进入人工审核：
+
+- 色块数与色号数不一致；
+- 多个文本框距离相近；
+- OCR 色号编号无法识别；
+- 色号名称换行或跨多个区域；
+- 图像被裁剪；
+- 同一色块附近出现多个候选名称；
+- 模型和几何匹配结论冲突；
+- 色块顺序与文本顺序疑似错位。
+
+---
+
+## 12. 文件夹名称与图片信息融合
+
+### 12.1 文件夹名称解析
+
+文件夹名称通常可能包含：
+
+- 品牌；
+- 产品中文名；
+- 产品英文名；
+- 系列；
+- 色号编号；
+- 色号名称；
+- 容量；
+- 宣传描述。
+
+Codex 应实现可追溯解析器，保留：
+
+```json
+{
+  "raw_folder_name": "橘朵-Judydoll-唇粉霜-N19 趋势裸【白桃生巧色】-1.8g",
+  "parsed": {
+    "brand_candidates": ["橘朵", "Judydoll"],
+    "product_type": "唇粉霜",
+    "shade_code": "N19",
+    "shade_name": "白桃生巧色",
+    "marketing_descriptor": "趋势裸",
+    "net_content": "1.8g"
+  },
+  "parser_version": "folder_parser_v1",
+  "parse_confidence": 0.94
+}
+```
+
+### 12.2 融合优先级
+
+不能简单规定所有字段都以某一来源为准。推荐按字段设置来源优先级。
+
+示例：
+
+- 品牌：人工映射表 > 文件夹名称 > 包装 OCR > VLM；
+- 色号编号：清晰 OCR/文件夹一致 > 文件夹名称 > VLM；
+- 色号名称：清晰 OCR > 文件夹名称 > 品牌官方别名表 > VLM；
+- 代表色：像素提取 > 多图融合 > VLM 颜色描述；
+- 质地：文字明确说明 > 商品类型/系列知识 > 视觉推断；
+- 适用肤色：图片文字明确说明 > 人工标注 > 模型推断。
+
+### 12.3 冲突保留
+
+不要覆盖冲突。应保存：
+
+- 候选值；
+- 来源；
+- 来源置信度；
+- 融合结论；
+- 冲突类型；
+- 是否需要审核。
+
+---
+
+## 13. 多图片商品级代表色融合
+
+同一商品或色号可能有多张可用图片，单图代表色不应直接等同于商品最终代表色。
+
+### 13.1 图片权重
+
+建议综合：
+
+- 图片角色权重；
+- 分割置信度；
+- 有效像素数量；
+- 高光/阴影风险；
+- 图片质量；
+- 色偏风险；
+- 与其他图片的一致性；
+- 是否为多色号图中的小色块；
+- 是否为唇部效果图。
+
+### 13.2 融合方法
+
+推荐在 Lab 空间进行：
+
+1. 收集同一色号的单图颜色候选；
+2. 计算两两 ΔE00；
+3. 聚类或稳健离群检测；
+4. 排除明显异常图；
+5. 按证据权重计算加权 medoid 或稳健中心；
+6. 保存主代表色、可信区间和备选颜色；
+7. 如果存在明显双峰，不强制合并，标记可能存在拍摄条件差异、质地差异或错误匹配。
+
+### 13.3 商品级输出
+
+```json
+{
+  "shade_id": "...",
+  "final_hex": "#A84F5B",
+  "final_lab": [46.8, 37.2, 14.1],
+  "fusion_method": "weighted_lab_medoid_v1",
+  "evidence_image_count": 5,
+  "accepted_image_count": 4,
+  "rejected_image_count": 1,
+  "cross_image_delta_e_median": 3.9,
+  "cross_image_delta_e_max": 12.4,
+  "confidence": 0.86,
+  "review_required": false
+}
+```
+
+---
+
+## 14. 商品色号知识数据库
+
+### 14.1 数据库分层
+
+建议至少区分四层：
+
+1. 原始层：文件、路径、图片哈希、OCR 原文；
+2. 证据层：图片角色、区域、颜色候选、文本框和空间关系；
+3. 推断层：标准化实体、匹配结果、商品级融合结果；
+4. 审核层：人工确认、修改、否决和备注。
+
+### 14.2 推荐表结构
+
+#### `brands`
+
+- `brand_id`
+- `canonical_name`
+- `english_name`
+- `aliases_json`
+
+#### `products`
+
+- `product_id`
+- `brand_id`
+- `canonical_product_name`
+- `product_type`
+- `series_name`
+- `raw_folder_name`
+
+#### `shades`
+
+- `shade_id`
+- `product_id`
+- `shade_code`
+- `shade_name`
+- `shade_aliases_json`
+- `normalized_descriptor_json`
+- `status`
+
+#### `images`
+
+- `image_id`
+- `source_path`
+- `sha256`
+- `phash`
+- `width`
+- `height`
+- `decode_status`
+- `quality_json`
+
+#### `image_roles`
+
+- `image_id`
+- `primary_role`
+- `secondary_roles_json`
+- `role_confidence`
+- `representative_color_eligible`
+- `eligibility_score`
+- `model_run_id`
+
+#### `regions`
+
+- `region_id`
+- `image_id`
+- `region_type`
+- `bbox_json`
+- `polygon_json`
+- `mask_path`
+- `detection_confidence`
+
+#### `ocr_spans`
+
+- `ocr_span_id`
+- `image_id`
+- `text_raw`
+- `text_normalized`
+- `bbox_json`
+- `ocr_confidence`
+- `engine`
+
+#### `region_text_links`
+
+- `region_id`
+- `ocr_span_id`
+- `relation_type`
+- `match_score`
+- `match_method`
+
+#### `image_color_candidates`
+
+- `color_candidate_id`
+- `image_id`
+- `region_id`
+- `hex`
+- `rgb_json`
+- `lab_json`
+- `method`
+- `confidence`
+- `diagnostics_json`
+
+#### `shade_representative_colors`
+
+- `shade_id`
+- `hex`
+- `rgb_json`
+- `lab_json`
+- `fusion_method`
+- `confidence`
+- `evidence_summary_json`
+- `version`
+
+#### `evidence_claims`
+
+- `claim_id`
+- `entity_type`
+- `entity_id`
+- `field_name`
+- `candidate_value_json`
+- `source_type`
+- `source_id`
+- `confidence`
+- `status`
+
+#### `model_runs`
+
+- `model_run_id`
+- `run_id`
+- `model_name`
+- `base_url_alias`
+- `prompt_name`
+- `prompt_version`
+- `request_hash`
+- `response_path`
+- `latency_ms`
+- `token_usage_json`
+- `status`
+- `error_json`
+
+#### `review_tasks`
+
+- `review_task_id`
+- `task_type`
+- `entity_id`
+- `priority`
+- `reason_codes_json`
+- `payload_json`
+- `status`
+- `reviewer`
+- `review_result_json`
+
+### 14.3 数据库技术选择
+
+- 本地开发和中小规模：SQLite + Parquet；
+- 多用户、持续写入和服务化：PostgreSQL；
+- 大量图片和 mask：文件系统或对象存储，数据库只存路径和哈希；
+- 原始模型响应建议保存为压缩 JSONL 文件，不全部塞入关系数据库。
+
+---
+
+## 15. `qwen3.6-plus` 调用封装要求
+
+### 15.1 配置
+
+不得在代码中硬编码 API Key。
+
+```text
+DASHSCOPE_API_KEY
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_MODEL=qwen3.6-plus
+```
+
+使用 OpenAI SDK 时，`base_url` 只填写到 `/v1`，SDK 自动调用 `/chat/completions`。
+
+### 15.2 本地图片输入
+
+本地图片需编码为 Base64 Data URL。调用层应：
+
+- 检查图片格式；
+- 检查编码后大小；
+- 对超大图片生成分析副本；
+- 记录分析副本尺寸和哈希；
+- 不修改原图；
+- 可选使用 JPEG/WEBP 压缩以降低请求体积，但必须记录压缩参数。
+
+### 15.3 强制 JSON 校验
+
+模型返回必须经过：
+
+1. 去除 Markdown 代码围栏；
+2. JSON 解析；
+3. Pydantic/JSON Schema 校验；
+4. 坐标范围校验；
+5. 标签枚举校验；
+6. 置信度范围校验；
+7. 失败时执行有限次数修复或重试；
+8. 原始响应始终保存。
+
+### 15.4 缓存键
+
+```text
+cache_key = SHA256(
+    image_sha256
+    + model_name
+    + prompt_name
+    + prompt_version
+    + generation_parameters
+)
+```
+
+图片和提示词不变时，应复用缓存，避免重复费用。
+
+### 15.5 重试与错误处理
+
+处理：
+
+- 网络超时；
+- 429 限流；
+- 5xx；
+- 无效 JSON；
+- 内容审核失败；
+- 图片过大；
+- 模型权限错误；
+- API Key 错误。
+
+重试采用指数退避和随机抖动。内容审核失败不能无限重试，应记录并进入人工队列。
+
+### 15.6 并发
+
+- 并发数配置化；
+- 使用异步或任务队列；
+- 限制请求速率；
+- 每张图片独立提交并落盘；
+- 支持断点续跑；
+- 批处理失败不影响已完成结果。
+
+---
+
+## 16. 置信度与异常检测
+
+### 16.1 置信度组成
+
+不要直接把模型自报置信度当作最终置信度。可组合：
+
+- VLM 角色置信度；
+- 分类规则一致性；
+- OCR 置信度；
+- 区域检测置信度；
+- 分割质量；
+- 颜色簇内离散度；
+- 多图颜色一致性；
+- 文件夹信息与图片信息一致性；
+- 文字—色块匹配分数；
+- 是否存在冲突来源。
+
+### 16.2 主要异常类型
+
+- `role_conflict`
+- `shade_count_mismatch`
+- `ocr_folder_conflict`
+- `text_region_ambiguous`
+- `color_outlier`
+- `low_valid_pixel_count`
+- `high_specular_ratio`
+- `strong_color_cast`
+- `duplicate_color_conflict`
+- `unknown_brand`
+- `unknown_shade`
+- `possible_new_shade`
+- `model_invalid_json`
+- `decode_recovered`
+- `content_moderation_blocked`
+
+### 16.3 新色号发现
+
+只有在以下条件下才标记 `possible_new_shade`：
+
+- 图片中存在清晰色号编号或名称；
+- 与当前商品上下文一致；
+- 数据库中不存在对应实体；
+- OCR 和 VLM 至少两个证据来源支持，或人工确认；
+- 多色号图中的色块和文字匹配置信度达到阈值。
+
+自动发现结果不能直接成为“已确认色号”。
+
+---
+
+## 17. 人工审核与持续学习
+
+### 17.1 审核对象
+
+优先审核：
+
+- 图片角色低置信度；
+- 是否可提色存在冲突；
+- 多色号图匹配不确定；
+- OCR 与文件夹名称冲突；
+- 多图代表色差异过大；
+- 新色号候选；
+- 唇部效果图颜色异常；
+- VLM 与像素结果明显不一致；
+- 高价值品牌或重点商品。
+
+### 17.2 审核界面最少展示
+
+- 原图；
+- 角色分类；
+- 分割 mask overlay；
+- OCR 框；
+- 色块—文字连线；
+- 单图颜色候选色块；
+- 商品级融合色块；
+- 来源信息和置信度；
+- 冲突原因；
+- 一键确认、修改、拒绝。
+
+### 17.3 回流数据
+
+人工审核结果应生成训练数据：
+
+- 图片角色标签；
+- 代表色资格标签；
+- 区域边界框或 mask；
+- OCR 修正文本；
+- 色号—色块配对；
+- 最终代表色选择；
+- 实体归一化映射。
+
+后续可以训练：
+
+- 本地图片角色分类器；
+- 代表色资格分类器；
+- 色块检测模型；
+- 文本—色块匹配模型；
+- 图像和文本联合色号相似度模型。
+
+---
+
+## 18. 评估方案
+
+Codex 必须建立固定评估集，不允许只看几个示例图。
+
+### 18.1 抽样原则
+
+评估集应覆盖：
+
+- 不同品牌；
+- 不同商品类型；
+- 八类图片角色；
+- 高低分辨率；
+- 白底、黑底、复杂背景；
+- 中文、英文、中英混合文字；
+- 单色图和多色号图；
+- 哑光、亮面、透明、珠光；
+- 裸色、深色、高饱和和低饱和颜色；
+- 正常图片和损坏图片。
+
+### 18.2 指标
+
+#### 角色分类
+
+- Accuracy；
+- Macro-F1；
+- 各类别 Precision/Recall；
+- 代表色资格 Precision/Recall；
+- 混淆矩阵。
+
+对“可提取代表色”应优先控制假阳性，即不要把包装图或宣传图错误送入颜色流水线。
+
+#### OCR
+
+- 字符准确率；
+- 色号编号准确率；
+- 色号名称准确率；
+- 文本框检测召回率。
+
+#### 色号—色块匹配
+
+- 匹配准确率；
+- 完全正确图片比例；
+- 歧义检测召回率。
+
+#### 代表色
+
+- 与人工选区结果的 ΔE00；
+- 同一色号跨图片一致性；
+- mask IoU；
+- 高光/背景误选率；
+- 商品级融合稳定性。
+
+### 18.3 初始验收目标
+
+以下仅作为第一阶段工程目标，Codex 可根据数据审计后修订，并记录原因：
+
+- 图片角色 Macro-F1 不低于 0.85；
+- 代表色资格判断 Precision 不低于 0.90；
+- 清晰多色号图的色号—色块匹配准确率不低于 0.90；
+- 清晰色号编号 OCR 准确率不低于 0.95；
+- 高质量单色图中，自动代表色与人工选区中位数 ΔE00 尽量控制在 5 以内；
+- 所有失败样本均可定位到明确阶段和错误类型；
+- 断点续跑不会重复处理已成功且版本未变化的数据。
+
+---
+
+## 19. 运行阶段与里程碑
+
+### 阶段 0：仓库和数据审计
+
+产出：
+
+- 数据画像；
+- 现有代码能力矩阵；
+- 已知问题清单；
+- 修订后的实施计划；
+- 本指南的第一轮变更记录。
+
+### 阶段 1：Manifest 和基础设施
+
+完成：
+
+- 稳定 ID；
+- 图片读取；
+- 去重；
+- 质量检测；
+- 日志；
+- 配置；
+- 断点续跑；
+- SQLite/Parquet 基础存储。
+
+### 阶段 2：图片角色分类
+
+完成：
+
+- 角色提示词；
+- qwen3.6-plus 调用；
+- JSON 校验；
+- 缓存；
+- 分类报告；
+- 第一批人工评估集。
+
+### 阶段 3：OCR 和视觉信息抽取
+
+完成：
+
+- OCR 文本框；
+- VLM 实体抽取；
+- 文件夹名称解析；
+- 证据表；
+- 冲突检测。
+
+### 阶段 4：单色图代表色提取
+
+优先实现：
+
+- 单色试色图；
+- 单色膏体图；
+- 色卡图；
+- mask 和颜色诊断输出。
+
+### 阶段 5：多色号图
+
+完成：
+
+- 多区域检测；
+- OCR 版面理解；
+- 色号—名称—色块匹配；
+- 每个色号独立颜色候选。
+
+### 阶段 6：商品级融合和数据库
+
+完成：
+
+- 多图融合；
+- 实体归一化；
+- 新色号候选；
+- 知识数据库；
+- 查询和导出接口。
+
+### 阶段 7：人工审核和持续学习
+
+完成：
+
+- 审核任务导出；
+- 审核结果回写；
+- 标注数据集版本化；
+- 本地模型训练准备。
+
+---
+
+## 20. CLI 建议
+
+```bash
+# 数据审计
+python -m lipcolor_pipeline.cli audit --config configs/pipeline.yaml
+
+# 创建或更新 manifest
+python -m lipcolor_pipeline.cli inventory --config configs/pipeline.yaml
+
+# 图片角色分类
+python -m lipcolor_pipeline.cli classify-roles --resume
+
+# OCR 和视觉信息抽取
+python -m lipcolor_pipeline.cli extract-info --resume
+
+# 代表色提取
+python -m lipcolor_pipeline.cli extract-colors --roles single_bullet single_swatch color_card
+
+# 多色号图处理
+python -m lipcolor_pipeline.cli process-multi-shade --resume
+
+# 商品级融合
+python -m lipcolor_pipeline.cli fuse-products
+
+# 构建数据库
+python -m lipcolor_pipeline.cli build-database
+
+# 导出人工审核批次
+python -m lipcolor_pipeline.cli export-review --priority high
+
+# 生成评估报告
+python -m lipcolor_pipeline.cli evaluate
+```
+
+所有命令应支持：
+
+- `--dry-run`
+- `--resume`
+- `--limit`
+- `--brand`
+- `--product`
+- `--image-id`
+- `--force`
+- `--config`
+- `--run-id`
+
+---
+
+## 21. 配置示例
+
+```yaml
+project:
+  raw_root: "data/raw"
+  output_root: "outputs"
+  database_path: "data/database/lipcolor.sqlite"
+
+vlm:
+  provider: "dashscope_openai_compatible"
+  model: "qwen3.6-plus"
+  base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  api_key_env: "DASHSCOPE_API_KEY"
+  timeout_seconds: 120
+  max_retries: 3
+  concurrency: 4
+  enable_thinking: false
+
+preprocessing:
+  convert_to_srgb: true
+  preserve_original: true
+  allow_truncated_recovery: false
+  max_analysis_long_edge: 2048
+  analysis_jpeg_quality: 92
+
+classification:
+  prompt_version: "1.0.0"
+  low_confidence_threshold: 0.70
+
+color:
+  working_space: "CIELAB"
+  delta_e_method: "CIEDE2000"
+  min_valid_pixels: 1000
+  save_masks: true
+  save_overlays: true
+  save_color_patches: true
+
+review:
+  export_format: "jsonl"
+  include_overlays: true
+  include_raw_model_response: true
+```
+
+阈值必须放在配置中，不要散落在代码里。
+
+---
+
+## 22. 测试要求
+
+### 22.1 单元测试
+
+至少覆盖：
+
+- 文件夹名称解析；
+- ID 稳定性；
+- Data URL 编码；
+- JSON 修复与 Schema 校验；
+- 坐标转换；
+- sRGB/Lab/HEX 转换；
+- ΔE00；
+- OCR 文本归一化；
+- 二分图匹配；
+- 多图颜色融合；
+- 缓存键；
+- 数据库迁移。
+
+### 22.2 集成测试
+
+建立小型固定测试集，至少包含：
+
+- 1 张单色膏体图；
+- 1 张单色试色图；
+- 1 张唇部图；
+- 1 张多色号图；
+- 1 张色卡；
+- 1 张包装图；
+- 1 张文字宣传图；
+- 1 张无效或损坏图。
+
+集成测试不应默认真实调用付费 API。使用缓存响应或 mock；另提供显式的在线测试命令。
+
+### 22.3 回归测试
+
+每次修改提示词、分割算法、颜色算法或融合规则后，输出：
+
+- 角色分类变化数量；
+- 可提色判断变化数量；
+- OCR 实体变化数量；
+- 色号—色块匹配变化数量；
+- 最终代表色 ΔE00 变化分布；
+- 新增和消失的审核任务。
+
+---
+
+## 23. 日志、审计和可视化产物
+
+每张图片应能生成或追踪到：
+
+- 原始图片路径；
+- 标准化分析图；
+- 图片角色 JSON；
+- OCR JSON；
+- VLM 原始响应；
+- 检测框 overlay；
+- 分割 mask；
+- 颜色像素分布；
+- Lab 聚类结果；
+- 代表色色块；
+- 多色号配对连线图；
+- 商品级融合报告；
+- 错误和审核任务。
+
+建议目录：
+
+```text
+outputs/runs/{run_id}/
+├── manifest/
+├── model_responses/
+├── roles/
+├── ocr/
+├── regions/
+├── masks/
+├── overlays/
+├── colors/
+├── matches/
+├── product_fusion/
+├── review/
+├── errors/
+└── reports/
+```
+
+---
+
+## 24. 关键实现原则总结
+
+1. 先理解图片角色，再决定后续处理；
+2. 先定位语义区域，再计算颜色；
+3. VLM 负责理解，像素算法负责精确颜色；
+4. OCR 负责文字和坐标，VLM 负责语义和版面；
+5. 多色号图必须显式建模空间关系；
+6. 商品级颜色来自多图片证据融合，不等同于单图主色；
+7. 文件夹名称是证据之一，不是无条件真值；
+8. 冲突必须保存，不得覆盖；
+9. 低置信度必须审核；
+10. 所有模型、规则、提示词和数据库结构都要版本化；
+11. 允许 Codex 根据数据修改实现，但必须有审计、变更记录和回归对比；
+12. 第一版应优先形成稳定、可审计的流水线，再追求复杂模型和端到端自动化。
+
+---
+
+## 25. Codex 首轮执行指令
+
+Codex 接收本指南后，应按以下顺序执行：
+
+1. 阅读整个仓库，不要立即重写；
+2. 定位原始数据目录、现有预处理结果和数据库；
+3. 统计真实数据分布并抽样查看图片；
+4. 识别本指南与现有项目冲突之处；
+5. 创建 `docs/repository_audit.md`；
+6. 创建或更新 `docs/implementation_plan.md`；
+7. 在本指南“变更记录”中记录第一轮修订；
+8. 优先复用已有可用模块；
+9. 先完成 manifest、模型调用封装和角色分类最小闭环；
+10. 用固定小样本验证后再扩大批处理；
+11. 每完成一个阶段，生成可视化和评估报告；
+12. 不得在没有证据的情况下声称整个数据集已经正确处理。
+
+---
+
+## 26. 变更记录
+
+- 初始版本：建立从图片角色分类、代表色提取、OCR、多色号空间匹配、多图片融合到知识数据库和人工审核的总体实现规范。
+- 后续由 Codex 根据仓库审计和真实数据分析继续维护。
