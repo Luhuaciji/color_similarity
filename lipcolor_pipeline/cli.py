@@ -1,4 +1,4 @@
-"""Unified command-line interface for stages 1.5 through 2.5."""
+"""Unified command-line interface for stages 1.5 through 2.6."""
 
 from __future__ import annotations
 
@@ -31,6 +31,12 @@ from .preprocessing import (
     migrate_legacy_preprocessing,
     run_stage2_preprocessing,
     validate_stage2,
+)
+from .quick_extract import (
+    export_quick_extraction,
+    plan_quick_extraction,
+    recover_quick_run_artifacts,
+    run_quick_extraction,
 )
 from .settings import PipelineSettings, load_settings
 from .vlm_client import repair_failed_pilot_analyses, run_pilot_vlm
@@ -209,6 +215,54 @@ def _cmd_pilot_run(args: argparse.Namespace) -> dict[str, Any]:
         max_calls=args.max_calls,
         image_id=args.image_id,
         limit=args.limit,
+    )
+
+
+def _cmd_quick_plan(args: argparse.Namespace) -> dict[str, Any]:
+    settings, workspace = _load_context(args)
+    return plan_quick_extraction(
+        workspace,
+        settings,
+        run_id=args.run_id,
+        image_id=args.image_id,
+        selection_manifest=args.selection_manifest,
+        folder_group_id=args.folder_group_id,
+        limit=args.limit,
+    )
+
+
+def _cmd_quick_run(args: argparse.Namespace) -> dict[str, Any]:
+    settings, workspace = _load_context(args)
+    return run_quick_extraction(
+        workspace,
+        settings,
+        run_id=args.run_id,
+        execute_online=args.execute_online,
+        max_calls=args.max_calls,
+        resume=args.resume,
+        image_id=args.image_id,
+        selection_manifest=args.selection_manifest,
+        folder_group_id=args.folder_group_id,
+        limit=args.limit,
+    )
+
+
+def _cmd_quick_export(args: argparse.Namespace) -> dict[str, Any]:
+    _settings, workspace = _load_context(args)
+    return export_quick_extraction(
+        workspace,
+        run_id=args.run_id,
+        output_dir=args.output_dir,
+    )
+
+
+def _cmd_quick_recover(args: argparse.Namespace) -> dict[str, Any]:
+    settings, workspace = _load_context(args)
+    return recover_quick_run_artifacts(
+        workspace,
+        settings,
+        run_id=args.run_id,
+        finalize=True,
     )
 
 
@@ -438,10 +492,22 @@ def _leaf(
     return parser
 
 
+def _add_quick_selector(parser: argparse.ArgumentParser) -> None:
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--image-id", default=None)
+    selector.add_argument(
+        "--selection-manifest",
+        type=Path,
+        default=None,
+    )
+    selector.add_argument("--folder-group-id", default=None)
+    selector.add_argument("--limit", type=int, default=None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m lipcolor_pipeline.cli",
-        description="Stages 1.5–2.5 lip-color pipeline.",
+        description="Stages 1.5–2.6 lip-color pipeline.",
     )
     groups = parser.add_subparsers(dest="group", required=True)
 
@@ -456,8 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
     workspace_init.add_argument(
         "--through-version",
         type=int,
-        choices=(2, 3, 4, 5, 6),
-        default=6,
+        choices=(2, 3, 4, 5, 6, 7),
+        default=7,
     )
 
     pilot = groups.add_parser("pilot")
@@ -650,6 +716,49 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     preprocess_validate.add_argument("--finalize", action="store_true")
+
+    quick = groups.add_parser("quick-extract")
+    quick_commands = quick.add_subparsers(dest="command", required=True)
+    quick_plan = _leaf(
+        quick_commands,
+        "plan",
+        _cmd_quick_plan,
+        help_text=(
+            "Plan Stage 2.6 selection, assets, cache, and provider budget."
+        ),
+    )
+    quick_plan.add_argument("--run-id", required=True)
+    _add_quick_selector(quick_plan)
+    quick_run = _leaf(
+        quick_commands,
+        "run",
+        _cmd_quick_run,
+        help_text=(
+            "Prepare assets, call/cache Qwen, merge, extract colour, and persist."
+        ),
+    )
+    quick_run.add_argument("--run-id", required=True)
+    quick_run.add_argument("--resume", action="store_true")
+    quick_run.add_argument("--execute-online", action="store_true")
+    quick_run.add_argument("--max-calls", type=int, default=None)
+    _add_quick_selector(quick_run)
+    quick_export = _leaf(
+        quick_commands,
+        "export",
+        _cmd_quick_export,
+        help_text="Export Stage 2.6 canonical image and occurrence results.",
+    )
+    quick_export.add_argument("--run-id", required=True)
+    quick_export.add_argument("--output-dir", type=Path, default=None)
+    quick_recover = _leaf(
+        quick_commands,
+        "recover",
+        _cmd_quick_recover,
+        help_text=(
+            "Recover interrupted request/raw/parsed artifacts into SQLite."
+        ),
+    )
+    quick_recover.add_argument("--run-id", required=True)
 
     annotate = groups.add_parser("annotate")
     annotate_commands = annotate.add_subparsers(dest="command", required=True)

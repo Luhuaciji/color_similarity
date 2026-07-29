@@ -47,6 +47,25 @@ annotation:
   blind_review_subset: 96
   split_seed: stage2-5-split-v1
 
+quick_extract:
+  implementation_version: "1.0.0"
+  prompt_name: quick_extract
+  prompt_version: "1.0.2"
+  schema_version: quick-image-extraction-1.0
+  stage2_run_id: stage2_full_20260728
+  ordinary_preview_max_long_edge: 2048
+  ordinary_preview_jpeg_quality: 92
+  bbox_inset_fraction: 0.03
+  color_max_long_edge: 256
+  color_min_valid_pixels: 300
+  color_min_valid_ratio: 0.05
+  kmeans_seed: 260
+  kmeans_max_clusters: 3
+  kmeans_iterations: 15
+  text_dedup_iou: 0.5
+  region_dedup_iou: 0.6
+  online_validation_hard_cap: 100
+
 thresholds:
   status: provisional_target
   threshold_version: pilot-and-annotation-draft-v1

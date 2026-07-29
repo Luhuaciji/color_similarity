@@ -21,7 +21,8 @@ from .settings import PipelineSettings, canonical_json, sha256_json
 from .stage1_manifest import apply_migrations, sha256_file, stable_id
 
 
-WORKSPACE_SCHEMA_VERSION = "stage2-5-3"
+WORKSPACE_SCHEMA_VERSION = "stage2-6-1"
+PIPELINE_VERSION = "0.3.0"
 DEPENDENCIES = (
     "fastapi",
     "numpy",
@@ -160,7 +161,7 @@ def open_database(
 def initialize_workspace(
     settings: PipelineSettings,
     *,
-    through_version: int = 6,
+    through_version: int = 7,
 ) -> Workspace:
     stage1_db = settings.project_path("stage1_database")
     if not stage1_db.is_file():
@@ -322,7 +323,7 @@ def begin_pipeline_run(
             run_id,
             workspace.dataset_snapshot_id,
             stage,
-            "0.2.0",
+            PIPELINE_VERSION,
             WORKSPACE_SCHEMA_VERSION,
             commit,
             dirty,
