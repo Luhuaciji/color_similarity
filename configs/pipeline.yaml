@@ -1,0 +1,55 @@
+project:
+  stage1_database: stage1_output/runs/stage1_full_20260728/manifest.sqlite
+  raw_root: downloaded_images
+  legacy_output_root: image_preprocessing_output
+  output_root: pipeline_output
+
+vlm:
+  provider: dashscope_openai_compatible
+  model_env: DASHSCOPE_MODEL
+  base_url_env: DASHSCOPE_BASE_URL
+  api_key_env: DASHSCOPE_API_KEY
+  prompt_name: image_role
+  prompt_version: 1.0.0
+  schema_version: content_visual_analysis-1.0
+  timeout_seconds: 120
+  max_retries: 3
+  concurrency: 4
+  enable_thinking: false
+  temperature: 0.0
+
+preprocessing:
+  implementation_version: "2.0.0"
+  ordinary_max_long_edge: 2048
+  analysis_jpeg_quality: 92
+  long_aspect_ratio: 4.0
+  long_min_edge: 3000
+  long_min_short_edge: 64
+  global_thumbnail_max_long_edge: 4096
+  tile_long_axis: 2048
+  tile_overlap: 512
+  semantic_invalid_short_edge: 16
+  semantic_invalid_min_pixels: 1024
+  hard_max_pixels: 100000000
+  selected_frame: 0
+  allow_truncated_recovery: false
+
+pilot:
+  initial_unique_images: 64
+  maximum_unique_images: 100
+  selection_seed: stage1-5-pilot-v1
+
+annotation:
+  accepted_unique_images: 480
+  target_per_primary_role: 60
+  mask_subset: 160
+  multi_shade_subset: 80
+  blind_review_subset: 96
+  split_seed: stage2-5-split-v1
+
+thresholds:
+  status: provisional_target
+  threshold_version: pilot-and-annotation-draft-v1
+  phash_high_confidence_distance: 4
+  phash_possible_duplicate_distance: 8
+  classification_low_confidence: 0.70

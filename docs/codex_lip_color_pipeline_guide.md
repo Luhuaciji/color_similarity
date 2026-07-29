@@ -1598,6 +1598,21 @@ Parquet 和全量 CSV 镜像是后续可选导出，不是阶段 1 门禁。
 - B 层 occurrence 上下文融合；
 - 人工核查。
 
+阶段 1.5 的来源上下文审核采用“全量机器预标 + 固定分层人工抽样 + 显式 Go/No-Go”，不要求把 Pilot 涉及的每条 B 层记录都伪装成人工真值：
+
+- 对所选内容的全部 occurrence/source context 生成并保留 B 层机器预标；
+- 对一个冻结的 Pilot 上下文总体按机器关系确定性抽取 40 条，当前策略配额为 `shade_conflict=15`、`same_product_unspecified_shade=10`、`contains_context_shade=8`、`unrelated=7`；
+- 机器预标与人工关系结论分别保存，逐项分歧和混淆矩阵必须留存；
+- 未抽中的记录明确标为 `machine_prelabel_unreviewed`，不得计作人工批准，也不得用于虚增人机一致率；
+- 抽样总体、seed、配额、策略版本和结果哈希必须不可变；后续内容补样不得静默改变已冻结策略，需要扩充审核总体时创建新策略版本；
+- 只有内容项审核、八类角色覆盖、40 条上下文样本审核和结构门禁全部通过后，才允许用户/团队写入具名的 `go`/`no_go` 决策；程序不得自动代替。
+
+该抽样用于验证 Pilot 的 B 层语义和误差形态，不替代阶段 2.5 固定评估集，也不改变 B 层关系枚举或 `occurrence_context_fusions` 的数据库语义。
+
+截至 2026-07-28，运行 `stage1_5_pilot_20260728` 已完成 65 个唯一 SHA256 的模型链路，并生成 192 条 B 层机器预标。初始 64 个内容项及冻结策略 `context_review_policy_95159cc1bada5dd086fdafd696d06dda` 的 40 条来源上下文均已人工审核；人机关系一致 38 条、分歧 2 条。
+
+为补足缺失的 `color_card`，仓库所有者明确指示“继续补选色卡，这部分无需人工审核，然后完成剩下的部分”。补选 SHA `da789b0437f65727b406c7d6393a3e0288620368d8a333861cc455c4703c670a` 的图像自身可见两个带 `#M03/#G01` 标识的规则数字色块。该结论以 `review_provenance=owner_delegated_agent` 和不可变 `owner_review_delegations`/`pilot_sample_additions` 留痕，不能解释为人工标注；授权 scope 只允许这一 SHA 的 `color_card` 角色与资格审核，不扩展到来源上下文或阶段 2.5。VLM 的 A 层原始结果 `multi_shade_comparison` 继续独立保留，没有被审核值覆盖。阶段 1.5 最终八类均覆盖并由 `repository_owner_instruction_20260728` 记录显式 `go`。
+
 ### 阶段 2：预处理加固与迁移
 
 完成：
@@ -1610,6 +1625,8 @@ Parquet 和全量 CSV 镜像是后续可选导出，不是阶段 1 门禁。
 - 配置快照、Git 提交、依赖快照和 transform fingerprint；
 - 断点续跑和历史产物迁移。
 
+当前运行 `stage2_full_20260728` 已验收通过：12,383 个内容严格成功、2 个损坏、1 个策略拒绝，映射 31,511 个 occurrence；229 个格式错配、172 个长图全局布局、1,330 个重叠 tile；31,511 个源文件 SHA 零漂移，派生资产零缺失、零哈希错误。
+
 ### 阶段 2.5：最小人工标注与评估工具
 
 在正式模型批处理前完成：
@@ -1621,6 +1638,12 @@ Parquet 和全量 CSV 镜像是后续可选导出，不是阶段 1 门禁。
 - `provisional_target` 评审及版本化冻结候选。
 
 完整多用户审核、优先级队列和持续学习仍在阶段 8。
+
+当前规范候选运行是 `stage2_5_annotation_v2_20260728`：640 个唯一 SHA256 按无泄漏组分为 train/validation/test=`384/128/128`，为最终 480 图的 `288/96/96` 留出拒绝余量；候选覆盖长图 34、格式错配 27、重复内容多 occurrence 274、目录碰撞 36、装饰条/invalid 13、盲复核候选 160。“装饰条/invalid”定义为 `semantic_invalid_candidate OR (extreme_aspect_ratio AND NOT long_image)`，不能只按严格解码失败判断。
+
+首版未标注候选的 split=`585/40/15`，原因是 provisional 近重复边与目录组的传递闭包形成 10,136 图超大连通组，无法支持最终 60/20/20。该版本已保留证据并标记 `superseded`，未删除或改写。v2 不拆分无泄漏组，而是在稳定组哈希之后按 split 配额选择候选。
+
+阶段 2.5 尚未完成：640 个候选当前均待审；只有人工最终接受 480 图（八类各 60）、完成 160 mask、80 多色号配对、96 盲复核及冲突裁决，并具名冻结后，才能生成固定 `evaluation_set`。阶段 1.5 单张色卡的所有者代理授权不豁免该门禁。
 
 ### 阶段 3：内容视觉分析与 occurrence 来源上下文融合
 
@@ -1824,7 +1847,7 @@ review:
 
 集成测试不应默认真实调用付费 API。使用缓存响应或 mock；另提供显式的在线测试命令。
 
-正式阶段 3 前另执行 50–100 个唯一 SHA256 的阶段 1.5 在线 Pilot，覆盖八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞。内容角色核查时默认隐藏当前 SKU、folder 目标色号和 `context_shade`。
+正式阶段 3 前另执行 50–100 个唯一 SHA256 的阶段 1.5 在线 Pilot，覆盖八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞。内容角色核查时默认隐藏当前 SKU、folder 目标色号和 `context_shade`。B 层对全部 Pilot 上下文保留机器预标，但人工核查只读取当前不可变策略中的 40 条分层样本；回归测试必须验证抽样确定性、配额、非样本保护、人机结果分离、分歧矩阵和具名 Go/No-Go 门禁。
 
 ### 22.3 回归测试
 
@@ -1978,5 +2001,36 @@ Codex 接收本指南后，应按以下顺序执行：
     - 16 个目录碰撞组和 9 个品牌别名组保留；SQLite/JSONL 主键与行数一致；原图全集 stat 和两轮各 100 张 SHA256 抽样通过。
   - 安全证据：目标脚本路径在当前树和全部本地可达对象中无结果，远端 `main` 已带租约重写；三层扫描 0 条发现且正向 fixture 有效。供应商失效状态未验证，记录为 `owner_waived_unverified`。
   - 兼容性影响：总体目标、核心标签、数据库语义、原图只读、模型双留存和后续 1.5/2/2.5 阶段设计均不变；只回写实际完成状态和显式例外。
+  - 修改人/代理：Codex。
+- 2026-07-28（阶段 1.5 来源上下文审核抽样）：
+  - 修改章节：16 的阶段 1.5、22.2、26 变更记录。
+  - 修改内容：B 层继续保存 Pilot 全部 occurrence/source context 的机器预标；人工门禁改为不可变、可复现的 40 条关系分层抽样；新增非样本语义、人机分歧留存和具名 Go/No-Go 要求。
+  - 修改原因：实际 64 图 Pilot 产生 183 条来源上下文。逐条审核不符合阶段 1.5“验证架构和误差形态”的边界；用户确认可由机器预标全量、人工审核固定代表性样本。首条已审记录中，机器 `shade_conflict` 与人工 `unrelated` 不一致，也证明不能用人工值覆盖机器值或把非样本当成人工批准。
+  - 代码证据：
+    - `database/migrations/005_context_review_sampling.sql`：不可变策略、固定样本和追加式 Gate 决策；
+    - `lipcolor_pipeline/pilot.py`：`create_context_review_sample`、确定性配额选择、分歧统计和 `validate_pilot`；
+    - `lipcolor_pipeline/review_app.py`：Pilot 来源上下文页面只返回当前策略样本，同时显示机器建议；
+    - `lipcolor_pipeline/annotations.py`：禁止对非样本写入 Pilot 来源关系人工批准；
+    - `lipcolor_pipeline/preprocessing.py`：阶段 2 要求 40 条全部审核且最新决策为 `go`；
+    - `tests/test_stage1_5_pipeline.py`：分层数量、确定性、不变性、非样本保护和 API 样本范围测试。
+  - 数据证据：`stage1_5_pilot_20260728` 有 183 条机器预标，分布为 `shade_conflict=115`、`same_product_unspecified_shade=38`、`contains_context_shade=23`、`unrelated=7`；策略 `context_review_policy_95159cc1bada5dd086fdafd696d06dda` 固定 40 条（15/10/8/7），当前 1 条已审核、39 条待审核，143 条明确为 `machine_prelabel_unreviewed`。
+  - 兼容性影响：原始总体目标、八类角色、B 层六类关系枚举、`content_visual_analyses`/`occurrence_context_fusions` 分层、原图只读和模型原始/解析双留存均保持不变；本次只修改阶段 1.5 的人工验收证据范围。固定策略之后的内容补样不静默进入旧抽样总体，如需纳入必须建立新版本。
+  - 修改人/代理：Codex。
+- 2026-07-28（阶段 1.5 色卡授权补选、阶段 2 验收与阶段 2.5 候选修订）：
+  - 修改章节：16 的阶段 1.5/2/2.5、26 变更记录。
+  - 修改内容：增加 `owner_review_delegations`、`pilot_sample_additions` 与 `annotation_events.review_provenance` 的所有者授权代理语义；回写阶段 1.5/2 的实际验收；阶段 2.5 候选改为稳定无泄漏组哈希后按 split 配额填充，并扩充装饰条/invalid 候选定义。
+  - 修改原因：用户明确要求“继续补选色卡，这部分无需人工审核，然后完成剩下的部分”；真实候选关系图又形成 10,136 图超大连通组，使首版 640 候选 split=`585/40/15`，且只用 4 个极小像素样本不能代表装饰条/invalid。
+  - 代码证据：
+    - `database/migrations/006_owner_delegated_pilot_review.sql`；
+    - `lipcolor_pipeline/pilot.py`：追加式补样、image-only 证据白名单和 provenance-aware Gate；
+    - `lipcolor_pipeline/annotations.py`：授权范围校验、候选 split 配额、装饰条/invalid 切片、旧候选保留式 supersede；
+    - `lipcolor_pipeline/preprocessing.py`：阶段 2 对 human/owner-delegated provenance 的独立校验；
+    - `tests/test_stage1_5_pipeline.py`：授权缺失拒绝、不可变 delegation 和代理事件留痕测试。
+  - 数据证据：
+    - 补选 SHA `da789b0437f65727b406c7d6393a3e0288620368d8a333861cc455c4703c670a` 的图像自身含两个带 `#M03/#G01` 标识的规则色块；VLM `multi_shade_comparison` 与授权代理 `color_card` 两份结论独立留存；
+    - `stage1_5_pilot_20260728`：65 图、192 条 B 层、40/40 人工来源抽样、38 一致/2 分歧、显式 Go；
+    - `stage2_full_20260728`：12,383 成功、2 损坏、1 策略拒绝，31,511 occurrence、229 格式错配、172 长图、1,330 tile，源 SHA 与资产硬门禁全通过；
+    - `stage2_5_annotation_v2_20260728`：640 候选 split=`384/128/128`，长图 34、格式错配 27、重复 274、碰撞 36、装饰条/invalid 13、盲复核候选 160。
+  - 兼容性影响：原始目标、八类核心角色代码、A/B 分层、`image_id=SHA256`、原图只读和模型原始/解析双留存均不变；代理 provenance 不得解释为 human，且本次单图授权不豁免阶段 2.5 的 480 图人工终审。
   - 修改人/代理：Codex。
 - 后续由 Codex 根据仓库审计、固定评估集和真实数据分析继续维护。

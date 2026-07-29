@@ -370,13 +370,20 @@ def apply_sql_migration(
         connection.commit()
 
 
-def apply_migrations(connection: sqlite3.Connection, migrations_dir: Path) -> None:
+def apply_migrations(
+    connection: sqlite3.Connection,
+    migrations_dir: Path,
+    *,
+    through_version: int | None = None,
+) -> None:
     migrations = sorted(migrations_dir.glob("*.sql"))
     if not migrations:
         raise FileNotFoundError(f"no migrations found in {migrations_dir}")
     for path in migrations:
         prefix, _, _rest = path.name.partition("_")
         version = int(prefix)
+        if through_version is not None and version > through_version:
+            continue
         sql = path.read_text(encoding="utf-8")
         apply_sql_migration(
             connection,
@@ -1189,7 +1196,13 @@ def build_manifest(
     connection.execute("PRAGMA journal_mode = DELETE")
     connection.execute("PRAGMA synchronous = FULL")
     try:
-        apply_migrations(connection, repo_root / "database" / "migrations")
+        # A Stage 1 manifest remains a self-contained immutable Stage 1 snapshot.
+        # Later-stage migrations are applied only to a copied workspace database.
+        apply_migrations(
+            connection,
+            repo_root / "database" / "migrations",
+            through_version=1,
+        )
         connection.execute("BEGIN IMMEDIATE")
         insert_rows(connection, "dataset_snapshots", [dataset_snapshot])
         insert_rows(connection, "pipeline_runs", [run_row])

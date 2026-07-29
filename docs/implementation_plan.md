@@ -3,7 +3,7 @@
 > 编制日期：2026-07-27  
 > 修订日期：2026-07-28
 > 依据：`docs/repository_audit.md` 与 `docs/codex_lip_color_pipeline_guide.md`  
-> 状态：阶段 0.5 与阶段 1 已完成并验收；阶段 1.5 尚未开始
+> 状态：阶段 0.5、1、1.5 与 2 已完成并验收；阶段 2.5 的工具和 640 图候选池已完成，480 图固定真值待人工终审
 > 原则：先建立可追溯数据底座，再逐步增加模型、颜色计算和知识数据库能力
 
 ## 0. 实施状态（2026-07-28）
@@ -13,11 +13,20 @@
 | 0 | `completed` | `docs/repository_audit.md` |
 | 0.5 | `passed_with_owner_override` | `docs/stage0_5_security_report.md`、脱敏扫描报告和远端历史重写结果 |
 | 1 | `passed` | `docs/stage1_completion_report.md`、运行 `stage1_full_20260728` |
-| 1.5–8 | `not_started` | 本轮停止，不自动进入 |
+| 1.5 | `passed` | 运行 `stage1_5_pilot_20260728`、65 个唯一 SHA256、192 条 B 层机器预标、40/40 条冻结人工抽样、显式 `go` |
+| 2 | `passed` | 运行 `stage2_full_20260728`；12,386 个内容、31,511 个 occurrence、全量源 SHA 与资产门禁通过 |
+| 2.5 | `candidate_pool_ready_awaiting_ground_truth` | 运行 `stage2_5_annotation_v2_20260728`；640 图无泄漏候选池已建立，480 图固定真值尚未终审/冻结 |
+| 3–8 | `not_started` | 不自动进入 |
 
 阶段 0.5 的原始目标仍是优先轮换/吊销泄露 Key。仓库所有者在实施时明确要求不再确认供应商侧状态、只从 Git 历史删除，因此实际记录为 `rotation_status=owner_waived_unverified`；这是一项显式例外和残余风险，不把未验证状态改写成“已失效”。
 
 阶段 1 已创建版本化 SQLite + JSONL manifest。它把本次 CSV 快照、当前下载器命名规则、31,511 个物理 occurrence 和 12,386 个内容 SHA 固化为不可覆盖的运行产物，不反向声称历史下载时已经存在成功 manifest。
+
+阶段 1.5 已在独立工作库中完成 65 个唯一 SHA256 的图片读取、派生资产、在线 VLM、Schema 校验、原始/解析双留存、A 层入库和 192 条 B 层机器预标。初始 64 个内容项与冻结的 40 条来源上下文样本均已人工审核；人机关系一致 38 条、分歧 2 条。为补足缺失的 `color_card`，仓库所有者明确指示“继续补选色卡，这部分无需人工审核，然后完成剩下的部分”。补选内容 `da789b0437f65727b406c7d6393a3e0288620368d8a333861cc455c4703c670a` 由 Codex 依据图像自身可见的两个规则数字色块审核为 `color_card`，并以 `owner_delegated_agent` 留痕，未伪装为人工标签。该授权只覆盖这一张补选色卡，不覆盖阶段 2.5 的 480 图终审。运行随后由 `repository_owner_instruction_20260728` 记录显式 `go`。
+
+阶段 2 运行 `stage2_full_20260728` 已完成并通过：12,383 个内容严格成功、2 个损坏、1 个策略拒绝；映射 31,508/2/1 个 occurrence；229 个扩展名/实际格式错配；172 个长图全局布局与 1,330 个重叠 tile；31,511 个原图 SHA 复核零漂移，派生资产零缺失、零哈希不一致。
+
+阶段 2.5 首版候选选择暴露出真实图关系图的超大连通组：10,136 个内容因 provisional 近重复边与目录组的传递闭包被归入同一无泄漏组，使 640 候选仅有 15 个 test，无法形成最终 60/20/20 固定集。该未标注版本已保留证据并标记 `superseded`。v2 在不拆分泄漏组的前提下按 split 配额选样，得到 384/128/128 候选；最终冻结仍要求 288/96/96。装饰条/invalid 切片也改为显式的 `semantic_invalid_candidate OR (extreme_aspect_ratio AND NOT long_image)`，v2 候选覆盖 13 个，不把“业务无效”错误收窄为仅 4 个极小像素样本。
 
 ## 1. 范围与非目标
 
@@ -607,7 +616,8 @@ status
 - 全局缩略图与必要的重叠 tile 派生资产及坐标；
 - 序列化请求、原始模型响应、解析 JSON、Schema 校验结果和错误；
 - SQLite 中的模型运行、A 层内容分析和 B 层上下文融合记录；
-- 人工核查包及核查结果；
+- 全量 B 层机器预标、不可变的来源上下文抽样策略/样本及人工核查结果；
+- 机器—人工关系混淆矩阵、逐项分歧证据和显式 Go/No-Go 决策；
 - 缓存命中、唯一付费调用数、延迟、token/成本和失败类型报告；
 - Schema/提示词/分层边界问题清单及阶段 3 的 Go/No-Go 结论。
 
@@ -717,6 +727,76 @@ created_at
 
 同一 `image_occurrence_id` 若关联多个 source record，应按明确的 occurrence/source context 分别保存 B 层结果，不得覆盖。`relationship_to_context` 的枚举和语义必须版本化。
 
+#### `context_review_sampling_policies`
+
+```text
+context_review_sampling_policy_id
+pilot_run_id
+annotation_set_id
+policy_version
+selection_seed
+target_count
+quotas_json
+source_relation_counts_json
+source_population_sha256
+selection_sha256
+created_at
+```
+
+该表冻结一次 Pilot 来源上下文审核的总体、分层配额、选择算法版本和结果哈希。记录创建后禁止 UPDATE/DELETE；Pilot 补样或 B 层规则变化不得静默重写原策略，必须创建新策略版本。
+
+#### `context_review_sample_items`
+
+```text
+context_review_sampling_policy_id
+annotation_item_id
+model_relationship
+model_confidence
+selected_reason
+deterministic_rank
+created_at
+```
+
+该表保存进入人工审核的固定样本及抽样时的机器关系快照。人工结论继续写入追加式 `annotation_events`，不得覆盖 `model_relationship`。未入样本的 B 层行明确保持 `machine_prelabel_unreviewed`，不能统计为人工通过。
+
+#### `pilot_gate_decisions`
+
+```text
+pilot_gate_decision_id
+pilot_run_id
+context_review_sampling_policy_id
+decision
+approved_by
+evidence_summary_json
+created_at
+```
+
+该表只追加显式 `go`/`no_go` 决策。只有结构门禁、内容审核、八类角色覆盖和来源上下文固定样本全部通过后才允许写入；阶段 2 只接受最新的显式 `go`。
+
+#### `owner_review_delegations` 与 `pilot_sample_additions`
+
+```text
+owner_review_delegation_id
+pilot_run_id
+scope
+instruction_text
+delegated_agent
+evidence_json
+created_at
+
+pilot_sample_addition_id
+pilot_run_id
+image_id
+selection_method
+selection_version
+selection_reason
+candidate_evidence_json
+owner_review_delegation_id
+created_at
+```
+
+两表均不可 UPDATE/DELETE。`annotation_events.review_provenance` 明确区分 `human` 与 `owner_delegated_agent`，代理事件必须引用同一 Pilot 的不可变授权。本次唯一授权 scope 为 `stage1_5_color_card_topup`，只允许对列明的 SHA 写入 `role=color_card` 与资格结论；不得扩展到来源上下文或阶段 2.5 固定集。
+
 本计划不创建 `image_roles` 混合表；Pilot 与正式阶段 3 均直接使用上述两表。
 
 ### 实施要点
@@ -729,8 +809,14 @@ created_at
 6. Schema 失败保留原始响应，有限修复/重试后写错误状态；
 7. A 层缓存键不含 occurrence、文件夹、SKU 或 context shade；
 8. B 层在 A 层之后独立运行，规则/上下文变化不使 A 层缓存失效；
-9. 人工核查分别评价“图片中看到了什么”和“它与当前来源商品是什么关系”；
-10. 若 50 个样本尚未覆盖全部必需切片，可继续补样，但总唯一 SHA256 不超过 100。
+9. 对采样内容涉及的全部 occurrence/source context 生成 B 层机器预标，不因人工抽样而丢弃未抽中的融合结果；
+10. 初始 64 图 Pilot 的 183 条来源上下文冻结为初始抽样总体，按机器关系确定性抽取 40 条：`shade_conflict=15`、`same_product_unspecified_shade=10`、`contains_context_shade=8`、`unrelated=7`；
+11. 只有固定抽样中的 40 条是阶段 1.5 来源关系人工必审项；初始总体未抽中的 143 条和补选色卡新增、未进入旧策略的 9 条均保持 `machine_prelabel_unreviewed`，当前合计 152 条，不得伪装成人工真值或纳入机器—人工一致率分母；
+12. 已存在的人工上下文审核必须纳入固定样本；机器预标和人工结论分开保存，分歧逐项保留并生成混淆矩阵；
+13. 抽样总体、配额和结果均不可变。后续为缺失角色补样时不得静默改变已冻结的 183 条总体；如确需把新增上下文纳入审核，创建新的策略版本；
+14. 人工核查分别评价“图片中看到了什么”和“它与当前来源商品是什么关系”；
+15. 若 50 个样本尚未覆盖全部必需切片，可继续补样，但总唯一 SHA256 不超过 100；
+16. 完成全部审核门禁后仍需由用户/团队记录具名的显式 Go/No-Go，不能由程序自动代替；`repository_owner_instruction_20260728` 是本次所有者明确指令的审计身份，不是模型自动决策。
 
 ### 测试方式
 
@@ -742,18 +828,27 @@ created_at
 - 长图全局缩略图、tile 重叠、原图坐标回映和合并测试；
 - 格式错配文件按实际 MIME 构建 Data URL；
 - SQLite/JSONL/文件资产间的路径、哈希和外键一致性；
-- 人工核查盲测：内容角色页面默认不显示当前 SKU/目录目标色号。
+- 人工核查盲测：内容角色页面默认不显示当前 SKU/目录目标色号；
+- 来源上下文抽样测试：相同总体、策略版本和 seed 重复运行得到相同 40 条及相同配额；
+- 不可变性测试：抽样策略/样本禁止 UPDATE/DELETE，非样本项不能被标记为人工通过；
+- 审核 API 测试：Pilot 来源上下文页只返回当前策略的 40 条，且保留机器建议与人工结论两个独立字段；
+- 门禁测试：必须保留分歧矩阵并有具名 `go` 决策，阶段 2 才能启动。
 
 ### 验收标准
 
 - `hard_gate`：Pilot 包含 50–100 个唯一 SHA256；
-- `hard_gate`：人工核查后确认八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞均有覆盖；缺一类即补样或判定 No-Go；
+- `hard_gate`：有效审核后确认八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞均有覆盖；默认要求人工，任何所有者代理例外都必须限定 SHA/scope 并独立报告，缺一类即补样或判定 No-Go；
 - `hard_gate`：100% 模型尝试都有序列化请求、原始响应、解析/Schema 状态和 SQLite 记录；
 - `hard_gate`：A 层请求审计未发现当前 SKU、文件夹目标色号或 `context_shade`；
 - `hard_gate`：相同 SHA256/分析资产/模型/提示词/参数组合至多产生一次成功付费调用；
 - `hard_gate`：长图同时具有全局缩略图和重叠 tile，且所有 tile/结果可回映原图；
 - `hard_gate`：所选重复内容与目录碰撞样本能产生多个独立 B 层上下文结果，不污染 A 层事实；
-- 人工核查的角色、资格、失败和上下文关系结果完整留存；
+- `hard_gate`：全部内容样本均有追加式角色/资格审核结论，且八类角色均有有效确认；人工与所有者授权代理数量必须分列，代理不得伪装为人工；
+- `hard_gate`：采样内容涉及的全部 B 层关系都有机器预标；当前 Pilot 的固定总体为 183 条；
+- `hard_gate`：来源上下文抽样恰为 40 条，配额为 `15/10/8/7`，全部具有人工关系结论；
+- `hard_gate`：未抽中的 143 条初始总体记录及 9 条补选新增上下文保持 `machine_prelabel_unreviewed`，不计作人工审核完成；
+- `hard_gate`：机器建议、人工结论、逐项分歧和混淆矩阵均完整留存，不能用人工结果覆盖机器结果；
+- `hard_gate`：完成上述条件后由用户/团队以 `approved_by` 写入显式 `go`；没有决策或最新决策为 `no_go` 时，阶段 2 仍被阻断；
 - 所有性能数字只作为 Pilot baseline，状态为 `provisional_target`，不得据此直接扩大到全量。
 
 ## 9. 阶段 2：基础预处理加固与历史产物迁移
@@ -998,9 +1093,11 @@ before_json
 after_json
 supersedes_event_id
 created_at
+review_provenance
+owner_review_delegation_id
 ```
 
-标注事件追加写入，修改通过 `supersedes_event_id` 形成链，不覆盖历史。mask 必须登记到 `derived_assets` 并可回映原图。
+标注事件追加写入，修改通过 `supersedes_event_id` 形成链，不覆盖历史。默认 `review_provenance=human`；所有者授权代理必须引用不可变 delegation，且不计作人工标注。mask 必须登记到 `derived_assets` 并可回映原图。
 
 #### `evaluation_sets`
 
@@ -1063,6 +1160,8 @@ frozen_at
 - 长图同时展示全局缩略图和局部 tile，标注坐标统一保存为原图坐标；
 - mask、polygon、bbox 和多色号配对均保存 schema/version；
 - 相同 SHA256 不跨 train/validation/test，近重复与同产品系列按组控制泄漏；
+- 候选池先按稳定组哈希确定 split，再按 `60/20/20` 配额填充；640 图候选必须为 `384/128/128`，最终 480 图必须为 `288/96/96`，不能因超大近重复连通组而放弃 test/validation 覆盖；
+- “装饰条/invalid”候选切片定义为 `semantic_invalid_candidate OR (extreme_aspect_ratio AND NOT long_image)`；严格解码成功不等于业务有效；
 - 目录碰撞样本必须保留多个 source context，不能只显示一个 SKU；
 - 至少双人复核一小部分样本，用于发现标注规范歧义；不以简单多数投票覆盖分歧；
 - 首轮建议规模为至少 400 个唯一 SHA256，但记为 `provisional_sampling_target`，由 Pilot 的小类分布和误差决定最终分层配额；
@@ -1085,12 +1184,15 @@ frozen_at
 - `hard_gate`：工具能创建并版本化角色、资格、mask 和多色号四类标注；
 - `hard_gate`：固定评估集覆盖八类角色、长图、格式错配、重复内容多 occurrence 和目录碰撞；
 - `hard_gate`：相同 SHA256 不跨数据集 split，目录碰撞来源未被静默合并；
+- `hard_gate`：最终 480 图 train/validation/test 恰为 `288/96/96`；候选池必须为各 split 留有足够拒绝余量；
 - `hard_gate`：角色/资格真值采集时不显示当前 SKU、文件夹目标色号或 `context_shade`；
 - `hard_gate`：所有 mask/region 可回映原图且原始图片 SHA256 不变；
 - `hard_gate`：标注修改有 annotator、时间、before/after 和 supersedes 链；
 - 首轮标注与 Pilot 指标报告齐备，所有性能阈值仍以 `provisional_target` 呈现；
 - 正式阶段 3 开始前，须另存经评审的阈值版本及冻结依据；
 - 阶段 8 的完整审核系统范围没有被删减或提前宣称完成。
+
+当前 v2 候选运行 `stage2_5_annotation_v2_20260728` 已满足自动门禁：640 个唯一 SHA256，候选 split 为 `384/128/128`，且无 group 泄漏；覆盖长图 34、格式错配 27、重复内容多 occurrence 274、目录碰撞 36、装饰条/invalid 13、盲复核候选 160。它仍不是固定真值：需人工最终接受 480 图（八类各 60）、完成 160 mask、80 多色号配对和 96 个盲复核，处理冲突并具名冻结后才能生成 `evaluation_set`。
 
 ## 11. 阶段 3：内容视觉分析与来源上下文融合
 
@@ -1901,14 +2003,18 @@ created_at
 - Git 本地与远端可达历史重写、`.env` 约定和密钥扫描；
 - 阶段 1 schema、迁移、构建器、校验器和测试；
 - 31,511 张原图的只读 SHA256 manifest 构建；
-- SQLite + JSONL 正式运行 `stage1_full_20260728` 和独立验收。
+- SQLite + JSONL 正式运行 `stage1_full_20260728` 和独立验收；
+- 阶段 1.5 运行 `stage1_5_pilot_20260728` 的 65 图选择/读取/VLM/Schema/SQLite/A-B 分层链路；
+- 初始 64 个内容项人工审核、1 个色卡所有者授权代理审核，以及 192 条 B 层机器预标；
+- 不可变来源上下文抽样策略 `context_review_policy_95159cc1bada5dd086fdafd696d06dda`：固定 40 条并已全部人工审核，人机一致 38 条、分歧 2 条；显式 `go` 已记录；
+- 阶段 2 运行 `stage2_full_20260728`：12,386 个内容与 31,511 个 occurrence 全量处理/验收通过，原图 SHA 零漂移；
+- 阶段 2.5 最小标注/审核工具，以及运行 `stage2_5_annotation_v2_20260728` 的 640 图候选池、split 与切片门禁。
 
-当前没有开始：
+当前尚未通过或未执行：
 
-- 阶段 1.5 的 50–100 唯一 SHA256 VLM Pilot；
-- 阶段 2 预处理加固；
-- 阶段 2.5 标注工具；
-- OCR、角色/资格分析、mask、颜色提取、实体融合或完整审核系统。
+- 阶段 2.5 的 480 图（八类各 60）、160 mask、80 多色号和 96 盲复核固定集尚未人工终审/冻结；当前 640 个候选均为待审，不能自动改写为真值；
+- 480 图最终 split 尚需按 `288/96/96` 接受，冲突需裁决并由用户/团队具名冻结；
+- OCR、颜色提取、实体融合、模型训练和阶段 8 完整审核系统均未开始。
 
 ## 21. 文档修订记录
 
@@ -1927,4 +2033,17 @@ created_at
   - 阶段 1 证据：`stage1_full_20260728` 生成 1 个数据集快照、2,309 个源记录、31,513 个源引用、31,511 个 occurrence、12,386 个内容 ID 和 31,513 条引用关系；16 个目录碰撞组、9 个品牌别名组均保留；
   - 验证结果：SQLite integrity/foreign key、JSONL SHA/行数/主键、来源闭环、源 CSV SHA、全部原图 stat 和两轮各 100 张 SHA256 抽样均通过；
   - 兼容性影响：原阶段目标和后续阶段设计不变；供应商侧失效未验证，显式记录为 `owner_waived_unverified`，不得解释为已轮换/吊销；本轮停在阶段 1。
+- 2026-07-28（阶段 1.5 来源上下文审核抽样）：
+  - 修改章节：0、8、20.1、21；
+  - 修改原因：实际 Pilot 的 64 个唯一 SHA256 关联 183 条 occurrence/source context；逐条人工复核会把架构 Pilot 变成全量上下文标注。用户确认改为“全量机器预标 + 固定分层人工抽样 + 显式 Go/No-Go”，同时必须避免把未抽中行误记为人工真值；
+  - 代码证据：`database/migrations/005_context_review_sampling.sql`；`lipcolor_pipeline/pilot.py` 的 `create_context_review_sample`/`validate_pilot`；`lipcolor_pipeline/review_app.py` 的仅样本视图；`lipcolor_pipeline/preprocessing.py` 的阶段 2 门禁；`tests/test_stage1_5_pipeline.py` 的分层、不可变和非样本保护测试；
+  - 数据证据：运行 `stage1_5_pilot_20260728` 有 183 条 B 层机器预标，分布为 `shade_conflict=115`、`same_product_unspecified_shade=38`、`contains_context_shade=23`、`unrelated=7`；策略 `context_review_policy_95159cc1bada5dd086fdafd696d06dda` 固定抽取 40 条（15/10/8/7），当前 1 条人工结论与机器建议不一致，证明必须保留独立的人机结果和分歧报告；
+  - 兼容性影响：八类核心角色、B 层关系枚举、A/B 表语义、原图只读和 183 条机器预标均未更改；只修订 Pilot 的人工证据门禁。未抽中的 143 条明确为 `machine_prelabel_unreviewed`，不能解释为人工批准；补样不会静默改变本策略。
+- 2026-07-28（阶段 1.5 色卡补选、阶段 2 验收与阶段 2.5 候选 v2）：
+  - 修改原因：用户明确要求“继续补选色卡，这部分无需人工审核，然后完成剩下的部分”；同时真实候选关系图形成 10,136 图超大连通组，首版 640 候选 split 为 `585/40/15`，无法支持最终 `60/20/20`，且仅用 4 个 `semantic_invalid_candidate` 不能覆盖审计发现的装饰条/业务 invalid；
+  - 代码证据：`database/migrations/006_owner_delegated_pilot_review.sql`；`lipcolor_pipeline/pilot.py` 的追加式补样与 provenance 门禁；`lipcolor_pipeline/annotations.py` 的 delegation 校验、候选 split 配额和装饰条/invalid 切片；`lipcolor_pipeline/preprocessing.py` 的 provenance-aware 阶段 2 门禁；
+  - 数据证据：补选 SHA `da789b0437f65727b406c7d6393a3e0288620368d8a333861cc455c4703c670a` 的图像自身含 `#M03/#G01` 两个规则数字色块；VLM 原始 A 层结果为 `multi_shade_comparison`，所有者授权代理审核为 `color_card`，两者分别保留；Pilot 最终 65 图、192 条 B 层、40/40 人工上下文抽样、38 条一致/2 条分歧并显式 Go；
+  - 阶段 2 证据：`stage2_full_20260728` 为 12,383 成功、2 损坏、1 策略拒绝，31,511 occurrence 全映射，229 格式错配、172 长图、1,330 tile；31,511 个源 SHA 零漂移，资产零缺失/零哈希错误；
+  - 阶段 2.5 证据：未标注首版候选已标记 `superseded` 且证据保留；`stage2_5_annotation_v2_20260728` 创建 640 候选，split 为 `384/128/128`，覆盖长图 34、格式错配 27、重复 274、碰撞 36、装饰条/invalid 13、盲复核候选 160；
+  - 兼容性影响：八类角色代码、A/B 表语义、`image_id=SHA256`、原图只读和模型原始/解析双留存均未改变；`owner_delegated_agent` 是独立 provenance，不重解释为 human。本次授权只覆盖单张色卡，不豁免阶段 2.5 的 480 图人工终审。
 - 修改依据：`docs/repository_audit.md` 的路径重放、目录碰撞、重复内容、格式错配、长图和明文 Key 证据，以及本轮用户明确的架构/阶段约束。

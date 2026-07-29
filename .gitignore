@@ -8,6 +8,8 @@
 
 # Generated manifests, databases, reports, and Python caches.
 /stage1_output/
+/pipeline_output/
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/

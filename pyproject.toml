@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lipcolor-pipeline"
+version = "0.2.0"
+description = "Auditable lip-color image inventory, VLM pilot, preprocessing, and annotation tools"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "numpy>=1.26,<3",
+  "openai>=2.0,<3",
+  "Pillow>=11.3,<13",
+  "pydantic>=2.11,<3",
+  "PyYAML>=6,<7",
+  "uvicorn>=0.35,<1",
+]
+
+[project.optional-dependencies]
+quality = ["opencv-python-headless>=4.9,<5"]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8,<10",
+]
+
+[tool.setuptools.packages.find]
+include = ["lipcolor_pipeline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "image_preprocessing_pipeline/tests"]
+addopts = "-q"
