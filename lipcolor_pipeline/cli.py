@@ -1,4 +1,4 @@
-"""Unified command-line interface for stages 1.5 through 2.6."""
+"""Unified command-line interface for image extraction and similarity."""
 
 from __future__ import annotations
 
@@ -38,9 +38,19 @@ from .quick_extract import (
     recover_quick_run_artifacts,
     run_quick_extraction,
 )
+from .shade_similarity import (
+    export_shade_similarity,
+    plan_shade_similarity,
+    run_shade_similarity,
+)
 from .settings import PipelineSettings, load_settings
 from .vlm_client import repair_failed_pilot_analyses, run_pilot_vlm
-from .workspace import Workspace, dependency_snapshot, initialize_workspace
+from .workspace import (
+    Workspace,
+    dependency_snapshot,
+    initialize_workspace,
+    load_existing_workspace,
+)
 
 
 def _json_default(value: Any) -> str:
@@ -83,6 +93,16 @@ def _load_context(args: argparse.Namespace) -> tuple[PipelineSettings, Workspace
     config_path = Path(args.config).resolve() if args.config else None
     settings = load_settings(repo_root, config_path)
     workspace = initialize_workspace(settings)
+    return settings, workspace
+
+
+def _load_readonly_context(
+    args: argparse.Namespace,
+) -> tuple[PipelineSettings, Workspace]:
+    repo_root = Path(args.repo_root).resolve()
+    config_path = Path(args.config).resolve() if args.config else None
+    settings = load_settings(repo_root, config_path)
+    workspace = load_existing_workspace(settings, required_migration=8)
     return settings, workspace
 
 
@@ -263,6 +283,46 @@ def _cmd_quick_recover(args: argparse.Namespace) -> dict[str, Any]:
         settings,
         run_id=args.run_id,
         finalize=True,
+    )
+
+
+def _cmd_shade_similarity_plan(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    settings, workspace = _load_readonly_context(args)
+    return plan_shade_similarity(
+        workspace,
+        settings,
+        run_id=args.run_id,
+        source_manifest=args.source_manifest,
+        top_k=args.top_k,
+        max_delta_e00=args.max_delta_e00,
+    )
+
+
+def _cmd_shade_similarity_run(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    settings, workspace = _load_context(args)
+    return run_shade_similarity(
+        workspace,
+        settings,
+        run_id=args.run_id,
+        source_manifest=args.source_manifest,
+        resume=args.resume,
+        top_k=args.top_k,
+        max_delta_e00=args.max_delta_e00,
+    )
+
+
+def _cmd_shade_similarity_export(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    _settings, workspace = _load_readonly_context(args)
+    return export_shade_similarity(
+        workspace,
+        run_id=args.run_id,
+        output_dir=args.output_dir,
     )
 
 
@@ -507,7 +567,10 @@ def _add_quick_selector(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m lipcolor_pipeline.cli",
-        description="Stages 1.5–2.6 lip-color pipeline.",
+        description=(
+            "Stages 1.5–2.6 lip-color pipeline and observed-colour "
+            "similarity MVP."
+        ),
     )
     groups = parser.add_subparsers(dest="group", required=True)
 
@@ -522,8 +585,8 @@ def build_parser() -> argparse.ArgumentParser:
     workspace_init.add_argument(
         "--through-version",
         type=int,
-        choices=(2, 3, 4, 5, 6, 7),
-        default=7,
+        choices=(2, 3, 4, 5, 6, 7, 8),
+        default=8,
     )
 
     pilot = groups.add_parser("pilot")
@@ -759,6 +822,70 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     quick_recover.add_argument("--run-id", required=True)
+
+    similarity = groups.add_parser("shade-similarity")
+    similarity_commands = similarity.add_subparsers(
+        dest="command",
+        required=True,
+    )
+    similarity_plan = _leaf(
+        similarity_commands,
+        "plan",
+        _cmd_shade_similarity_plan,
+        help_text=(
+            "Plan canonical Stage 2.6 inputs, profiles, pairs, and Top-K "
+            "without writes."
+        ),
+    )
+    similarity_plan.add_argument("--run-id", required=True)
+    similarity_plan.add_argument(
+        "--source-manifest",
+        type=Path,
+        required=True,
+    )
+    similarity_plan.add_argument("--top-k", type=int, default=None)
+    similarity_plan.add_argument(
+        "--max-delta-e00",
+        type=float,
+        default=None,
+    )
+    similarity_run = _leaf(
+        similarity_commands,
+        "run",
+        _cmd_shade_similarity_run,
+        help_text=(
+            "Resolve shade identities, build swatch profiles, and persist "
+            "local CIEDE2000 results."
+        ),
+    )
+    similarity_run.add_argument("--run-id", required=True)
+    similarity_run.add_argument(
+        "--source-manifest",
+        type=Path,
+        required=True,
+    )
+    similarity_run.add_argument("--resume", action="store_true")
+    similarity_run.add_argument("--top-k", type=int, default=None)
+    similarity_run.add_argument(
+        "--max-delta-e00",
+        type=float,
+        default=None,
+    )
+    similarity_export = _leaf(
+        similarity_commands,
+        "export",
+        _cmd_shade_similarity_export,
+        help_text=(
+            "Export observed shade observations, profiles, all pairs, "
+            "Top-K, and summary."
+        ),
+    )
+    similarity_export.add_argument("--run-id", required=True)
+    similarity_export.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+    )
 
     annotate = groups.add_parser("annotate")
     annotate_commands = annotate.add_subparsers(dest="command", required=True)

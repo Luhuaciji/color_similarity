@@ -66,6 +66,23 @@ quick_extract:
   region_dedup_iou: 0.6
   online_validation_hard_cap: 100
 
+shade_similarity:
+  implementation_version: "1.0.0"
+  source_manifest_schema: "observed-similarity-source-1.0"
+  output_semantics: image_observed_color_similarity_baseline
+  formal_region_types:
+    - swatch
+  accepted_color_confidence:
+    - medium
+    - high
+  top_k: 10
+  max_delta_e00:
+  lab_integrity_tolerance: 0.000001
+  display_score_scale: 10.0
+  display_score_version: inverse-quadratic-d10-v1
+  pair_block_size: 256
+  pair_insert_batch_size: 5000
+
 thresholds:
   status: provisional_target
   threshold_version: pilot-and-annotation-draft-v1

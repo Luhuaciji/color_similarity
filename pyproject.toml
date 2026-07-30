@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lipcolor-pipeline"
-version = "0.3.0"
-description = "Auditable lip-color image inventory, VLM, preprocessing, annotation, and quick extraction tools"
+version = "0.4.0"
+description = "Auditable lip-color image inventory, extraction, and observed-colour similarity tools"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "fastapi>=0.116,<1",

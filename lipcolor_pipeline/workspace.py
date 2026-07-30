@@ -21,8 +21,8 @@ from .settings import PipelineSettings, canonical_json, sha256_json
 from .stage1_manifest import apply_migrations, sha256_file, stable_id
 
 
-WORKSPACE_SCHEMA_VERSION = "stage2-6-1"
-PIPELINE_VERSION = "0.3.0"
+WORKSPACE_SCHEMA_VERSION = "observed-similarity-mvp-1"
+PIPELINE_VERSION = "0.4.0"
 DEPENDENCIES = (
     "fastapi",
     "numpy",
@@ -161,7 +161,7 @@ def open_database(
 def initialize_workspace(
     settings: PipelineSettings,
     *,
-    through_version: int = 7,
+    through_version: int = 8,
 ) -> Workspace:
     stage1_db = settings.project_path("stage1_database")
     if not stage1_db.is_file():
@@ -244,6 +244,67 @@ def initialize_workspace(
     source_hash_after = sha256_file(stage1_db)
     if source_hash_before != source_hash_after:
         raise RuntimeError("Stage 1 database changed while initializing workspace")
+
+    return Workspace(
+        repo_root=settings.repo_root,
+        output_root=output_root,
+        database_path=database_path,
+        dataset_snapshot_id=dataset_snapshot_id,
+        stage1_database_path=stage1_db,
+    )
+
+
+def load_existing_workspace(
+    settings: PipelineSettings,
+    *,
+    required_migration: int = 8,
+) -> Workspace:
+    """Load an already initialized workspace without filesystem or DB writes."""
+
+    stage1_db = settings.project_path("stage1_database")
+    if not stage1_db.is_file():
+        raise FileNotFoundError(f"Stage 1 database not found: {stage1_db}")
+    with open_database(stage1_db, readonly=True) as source:
+        row = source.execute(
+            "SELECT dataset_snapshot_id FROM dataset_snapshots"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Stage 1 database has no dataset snapshot")
+        dataset_snapshot_id = str(row[0])
+
+    output_root = settings.project_path("output_root")
+    database_path = (
+        output_root
+        / "workspaces"
+        / dataset_snapshot_id
+        / "lipcolor.sqlite"
+    )
+    if not database_path.is_file():
+        raise FileNotFoundError(
+            "workspace is not initialized; run workspace-init first: "
+            f"{database_path}"
+        )
+    with open_database(database_path, readonly=True) as connection:
+        copied_snapshot = connection.execute(
+            "SELECT dataset_snapshot_id FROM dataset_snapshots"
+        ).fetchone()
+        if (
+            copied_snapshot is None
+            or str(copied_snapshot[0]) != dataset_snapshot_id
+        ):
+            raise RuntimeError(
+                "workspace database belongs to another dataset snapshot"
+            )
+        migration_row = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+        migration_version = int(migration_row[0] or 0)
+        if migration_version < required_migration:
+            raise RuntimeError(
+                "workspace migration is too old for this read-only command; "
+                "run workspace-init --through-version "
+                f"{required_migration}"
+            )
 
     return Workspace(
         repo_root=settings.repo_root,

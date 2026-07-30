@@ -1,9 +1,10 @@
-"""Versioned configuration loading for stages 1.5 through 2.6."""
+"""Versioned configuration loading through observed-colour similarity MVP."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -106,6 +107,20 @@ DEFAULTS: dict[str, Any] = {
         "region_dedup_iou": 0.6,
         "online_validation_hard_cap": 100,
     },
+    "shade_similarity": {
+        "implementation_version": "1.0.0",
+        "source_manifest_schema": "observed-similarity-source-1.0",
+        "output_semantics": "image_observed_color_similarity_baseline",
+        "formal_region_types": ["swatch"],
+        "accepted_color_confidence": ["medium", "high"],
+        "top_k": 10,
+        "max_delta_e00": None,
+        "lab_integrity_tolerance": 1.0e-6,
+        "display_score_scale": 10.0,
+        "display_score_version": "inverse-quadratic-d10-v1",
+        "pair_block_size": 256,
+        "pair_insert_batch_size": 5000,
+    },
     "thresholds": {
         "status": "provisional_target",
         "threshold_version": "pilot-and-annotation-draft-v1",
@@ -183,3 +198,43 @@ def _validate(values: Mapping[str, Any]) -> None:
         raise ValueError("Pilot image counts must satisfy 50 <= initial <= max <= 100")
     if values["thresholds"].get("status") != "provisional_target":
         raise ValueError("unreviewed thresholds must remain provisional_target")
+    similarity = values["shade_similarity"]
+    if (
+        similarity.get("source_manifest_schema")
+        != "observed-similarity-source-1.0"
+    ):
+        raise ValueError("shade similarity source manifest schema is unsupported")
+    if (
+        similarity.get("output_semantics")
+        != "image_observed_color_similarity_baseline"
+    ):
+        raise ValueError("shade similarity output semantics must remain explicit")
+    if list(similarity.get("formal_region_types", [])) != ["swatch"]:
+        raise ValueError("shade similarity MVP must remain swatch-only")
+    if set(similarity.get("accepted_color_confidence", [])) != {
+        "medium",
+        "high",
+    }:
+        raise ValueError(
+            "shade similarity MVP accepts exactly medium/high colours"
+        )
+    if int(similarity["top_k"]) <= 0:
+        raise ValueError("shade similarity top_k must be positive")
+    maximum_distance = similarity.get("max_delta_e00")
+    if maximum_distance is not None and (
+        not math.isfinite(float(maximum_distance))
+        or float(maximum_distance) < 0.0
+    ):
+        raise ValueError(
+            "shade similarity max_delta_e00 must be non-negative"
+        )
+    for field in (
+        "lab_integrity_tolerance",
+        "display_score_scale",
+    ):
+        value = float(similarity[field])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"shade similarity {field} must be positive")
+    for field in ("pair_block_size", "pair_insert_batch_size"):
+        if int(similarity[field]) <= 0:
+            raise ValueError(f"shade similarity {field} must be positive")
